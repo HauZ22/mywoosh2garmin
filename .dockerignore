@@ -1,0 +1,10 @@
+.git
+.gitignore
+data
+*.exe
+*.fit
+*.tcx
+join_workout_player_GNRJPZNZXJHQVCVJVXJH.tcx
+images
+README.md
+dist

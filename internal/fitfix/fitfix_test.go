@@ -1,4 +1,4 @@
-package main
+package fitfix
 
 import (
 	"os"
@@ -73,30 +73,42 @@ func createTestFitFile(t *testing.T, path string) {
 	}
 }
 
-func TestFixFitFile(t *testing.T) {
+func TestFixFit(t *testing.T) {
 	tmpDir := t.TempDir()
 	inputPath := filepath.Join(tmpDir, "MyNewActivity-3.8.5.fit")
-	outputPath := filepath.Join(tmpDir, "MyNewActivity-3.8.5_fixed.fit")
 
-	// Create synthetic MyWhoosh FIT file
 	createTestFitFile(t, inputPath)
 
-	// Run the fixer
-	if err := fixFitFile(inputPath, outputPath); err != nil {
-		t.Fatalf("fixFitFile failed: %v", err)
-	}
-
-	// Read back and verify
-	f, err := os.Open(outputPath)
+	raw, err := os.ReadFile(inputPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+
+	fixed, err := FixFit(raw)
+	if err != nil {
+		t.Fatalf("FixFit failed: %v", err)
+	}
+
+	// Decode the result and verify.
+	f, err := os.OpenFile(filepath.Join(tmpDir, "fixed.fit"), os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(fixed); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	df, err := os.Open(filepath.Join(tmpDir, "fixed.fit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer df.Close()
 
 	lis := filedef.NewListener()
 	defer lis.Close()
 
-	dec := decoder.New(f,
+	dec := decoder.New(df,
 		decoder.WithMesgListener(lis),
 		decoder.WithBroadcastOnly(),
 	)
@@ -150,7 +162,7 @@ func TestFindMostRecentFitFile(t *testing.T) {
 		}
 	}
 
-	got, err := findMostRecentFitFile(tmpDir)
+	got, err := FindMostRecentFitFile(tmpDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +174,7 @@ func TestFindMostRecentFitFile(t *testing.T) {
 }
 
 func TestGenerateOutputFilename(t *testing.T) {
-	name := generateOutputFilename("/some/path/MyNewActivity-3.8.5.fit")
+	name := GenerateOutputFilename("/some/path/MyNewActivity-3.8.5.fit")
 	if !contains(name, "MyNewActivity-3.8.5_") || !contains(name, ".fit") {
 		t.Errorf("unexpected filename: %s", name)
 	}

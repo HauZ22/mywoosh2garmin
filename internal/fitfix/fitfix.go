@@ -1,6 +1,10 @@
-package main
+// Package fitfix reads MyWhoosh FIT activity files, fixes missing session
+// averages, strips bogus temperature readings and spoofs the recording
+// device to a Garmin fenix 6S so Garmin Connect fully processes the file.
+package fitfix
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +20,8 @@ import (
 	"github.com/muktihari/fit/profile/filedef"
 	"github.com/muktihari/fit/profile/typedef"
 	"github.com/muktihari/fit/proto"
+
+	"mywhoosh2garmin/internal/device"
 )
 
 // FIT protocol invalid sentinel values per base type.
@@ -25,23 +31,30 @@ const (
 	sint8Invalid  = int8(0x7F)
 )
 
-// Device spoofing constants.
-const (
-	garminManufacturer = typedef.ManufacturerGarmin   // 1
-	fenix6sProduct     = typedef.GarminProductFenix6s // 3288
-	fakeSerialNumber   = uint32(3420897194)
-)
-
-// logFn can be overridden to redirect log output (e.g., to a GUI).
+// logFn can be overridden to redirect log output (e.g. to a GUI or server).
 var logFn = func(format string, args ...interface{}) {
 	fmt.Printf(format, args...)
+}
+
+// SetLog redirects the package log output.
+func SetLog(fn func(string, ...interface{})) {
+	if fn != nil {
+		logFn = fn
+	}
 }
 
 // ---------------------------------------------------------------------------
 // MyWhoosh directory detection
 // ---------------------------------------------------------------------------
 
-func findMyWhooshDir() (string, error) {
+// IsDir reports whether path is an existing directory.
+func IsDir(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// FindMyWhooshDir tries to auto-detect the local MyWhoosh data directory.
+func FindMyWhooshDir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -53,7 +66,7 @@ func findMyWhooshDir() (string, error) {
 			"Library", "Containers", "com.whoosh.whooshgame",
 			"Data", "Library", "Application Support",
 			"Epic", "MyWhoosh", "Content", "Data")
-		if isDir(p) {
+		if IsDir(p) {
 			return p, nil
 		}
 		return "", fmt.Errorf("not found: %s", p)
@@ -68,7 +81,7 @@ func findMyWhooshDir() (string, error) {
 			if e.IsDir() && strings.HasPrefix(e.Name(), "MyWhooshTechnologyService.") {
 				p := filepath.Join(base, e.Name(),
 					"LocalCache", "Local", "MyWhoosh", "Content", "Data")
-				if isDir(p) {
+				if IsDir(p) {
 					return p, nil
 				}
 			}
@@ -80,18 +93,13 @@ func findMyWhooshDir() (string, error) {
 	}
 }
 
-func isDir(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
-}
-
 // ---------------------------------------------------------------------------
 // FIT file discovery
 // ---------------------------------------------------------------------------
 
-// findMostRecentFitFile returns the MyNewActivity-*.fit file with the highest
+// FindMostRecentFitFile returns the MyNewActivity-*.fit file with the highest
 // version number (e.g. MyNewActivity-3.8.5.fit > MyNewActivity-3.7.0.fit).
-func findMostRecentFitFile(dir string) (string, error) {
+func FindMostRecentFitFile(dir string) (string, error) {
 	matches, err := filepath.Glob(filepath.Join(dir, "MyNewActivity-*.fit"))
 	if err != nil {
 		return "", err
@@ -121,7 +129,8 @@ func cmpVersionParts(a, b []string) int {
 	return len(a) - len(b)
 }
 
-func generateOutputFilename(inputPath string) string {
+// GenerateOutputFilename builds an output filename for a fixed FIT file.
+func GenerateOutputFilename(inputPath string) string {
 	name := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
 	ts := time.Now().Format("2006-01-02_150405")
 	return fmt.Sprintf("%s_%s.fit", name, ts)
@@ -131,31 +140,25 @@ func generateOutputFilename(inputPath string) string {
 // FIT file processing
 // ---------------------------------------------------------------------------
 
-// fixFitFile reads a MyWhoosh FIT activity, fixes missing session averages,
-// strips temperature from records, spoofs the device, and writes the result.
-func fixFitFile(inputPath, outputPath string) error {
-	f, err := os.Open(inputPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
+// FixFit reads MyWhoosh FIT activity bytes, fixes missing session averages,
+// strips bogus temperature from records, spoofs the device and returns the
+// repaired FIT bytes.
+func FixFit(data []byte) ([]byte, error) {
 	lis := filedef.NewListener()
 	defer lis.Close()
 
-	dec := decoder.New(f,
+	dec := decoder.New(bytes.NewReader(data),
 		decoder.WithMesgListener(lis),
 		decoder.WithBroadcastOnly(),
 	)
 
-	_, err = dec.Decode()
-	if err != nil {
-		return fmt.Errorf("decode: %w", err)
+	if _, err := dec.Decode(); err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
 	}
 
 	activity, ok := lis.File().(*filedef.Activity)
 	if !ok {
-		return fmt.Errorf("not an activity file (got %T)", lis.File())
+		return nil, fmt.Errorf("not an activity file (got %T)", lis.File())
 	}
 
 	// Collect metrics from records and strip temperature
@@ -200,13 +203,11 @@ func fixFitFile(inputPath, outputPath string) error {
 	// Encode
 	fit := activity.ToFIT(nil)
 
-	out, err := os.Create(outputPath)
-	if err != nil {
-		return err
+	var out bytes.Buffer
+	if err := encoder.New(&out, encoder.WithProtocolVersion(proto.V2)).Encode(&fit); err != nil {
+		return nil, fmt.Errorf("encode: %w", err)
 	}
-	defer out.Close()
-
-	return encoder.New(out, encoder.WithProtocolVersion(proto.V2)).Encode(&fit)
+	return out.Bytes(), nil
 }
 
 func shouldFixU16(v uint16) bool { return v == uint16Invalid || v == 0 }
@@ -233,26 +234,26 @@ func avgU8(vals []uint8) uint8 {
 // ---------------------------------------------------------------------------
 
 func spoofDevice(activity *filedef.Activity) {
-	activity.FileId.Manufacturer = garminManufacturer
-	activity.FileId.Product = fenix6sProduct.Uint16()
-	activity.FileId.SerialNumber = fakeSerialNumber
+	activity.FileId.Manufacturer = typedef.ManufacturerGarmin
+	activity.FileId.Product = typedef.GarminProductFenix6s.Uint16()
+	activity.FileId.SerialNumber = device.FakeSerialNumber
 
 	for _, di := range activity.DeviceInfos {
-		di.Manufacturer = garminManufacturer
-		di.Product = fenix6sProduct.Uint16()
-		di.SerialNumber = fakeSerialNumber
+		di.Manufacturer = typedef.ManufacturerGarmin
+		di.Product = typedef.GarminProductFenix6s.Uint16()
+		di.SerialNumber = device.FakeSerialNumber
 	}
 
-	logFn("  → device spoofed: Garmin Fenix 6S Pro (product %d)\n", fenix6sProduct)
+	logFn("  → device spoofed: Garmin Fenix 6S Pro (product %d)\n", device.Fenix6SProduct)
 }
 
 // ---------------------------------------------------------------------------
-// Sync helpers
+// Sync helpers (local-file mode)
 // ---------------------------------------------------------------------------
 
-// findUnsyncedFitFiles returns *.fit files modified in the last 30 days
+// FindUnsyncedFitFiles returns *.fit files modified in the last 30 days
 // that don't have a .synced marker file next to them.
-func findUnsyncedFitFiles(dir string) ([]string, error) {
+func FindUnsyncedFitFiles(dir string) ([]string, error) {
 	matches, err := filepath.Glob(filepath.Join(dir, "*.fit"))
 	if err != nil {
 		return nil, err
@@ -269,7 +270,7 @@ func findUnsyncedFitFiles(dir string) ([]string, error) {
 		if info.ModTime().Before(cutoff) {
 			continue
 		}
-		if isSynced(path) {
+		if IsSynced(path) {
 			continue
 		}
 		result = append(result, path)
@@ -285,13 +286,13 @@ func findUnsyncedFitFiles(dir string) ([]string, error) {
 	return result, nil
 }
 
-// isSynced checks if a .synced marker file exists for the given FIT file.
-func isSynced(fitPath string) bool {
+// IsSynced checks if a .synced marker file exists for the given FIT file.
+func IsSynced(fitPath string) bool {
 	_, err := os.Stat(fitPath + ".synced")
 	return err == nil
 }
 
-// markSynced creates a .synced marker file next to the FIT file.
-func markSynced(fitPath string) error {
+// MarkSynced creates a .synced marker file next to the FIT file.
+func MarkSynced(fitPath string) error {
 	return os.WriteFile(fitPath+".synced", []byte(time.Now().Format(time.RFC3339)), 0o644)
 }

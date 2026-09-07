@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,74 +16,14 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"mywhoosh2garmin/garmin"
+	"mywhoosh2garmin/internal/core"
+	"mywhoosh2garmin/internal/fitfix"
 	"mywhoosh2garmin/mywhoosh"
 )
-
-// ---------------------------------------------------------------------------
-// App config (persisted to ~/.mywhoosh2garmin/config.json)
-// ---------------------------------------------------------------------------
-
-type appConfig struct {
-	MyWhooshEmail string `json:"mywhoosh_email"`
-	GarminEmail   string `json:"garmin_email"`
-}
 
 func appConfigDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".mywhoosh2garmin")
-}
-
-func loadAppConfig() appConfig {
-	var cfg appConfig
-	data, err := os.ReadFile(filepath.Join(appConfigDir(), "config.json"))
-	if err == nil {
-		json.Unmarshal(data, &cfg)
-	}
-	return cfg
-}
-
-func saveAppConfig(cfg appConfig) {
-	dir := appConfigDir()
-	os.MkdirAll(dir, 0o700)
-	data, _ := json.MarshalIndent(cfg, "", "  ")
-	os.WriteFile(filepath.Join(dir, "config.json"), data, 0o600)
-}
-
-// ---------------------------------------------------------------------------
-// Synced-activity tracker (persisted to ~/.mywhoosh2garmin/synced.json)
-// ---------------------------------------------------------------------------
-
-type syncedTracker struct {
-	mu       sync.Mutex
-	path     string
-	uploaded map[string]string // activityID → upload timestamp
-}
-
-func newSyncedTracker(dir string) *syncedTracker {
-	st := &syncedTracker{
-		path:     filepath.Join(dir, "synced.json"),
-		uploaded: make(map[string]string),
-	}
-	data, err := os.ReadFile(st.path)
-	if err == nil {
-		json.Unmarshal(data, &st.uploaded)
-	}
-	return st
-}
-
-func (st *syncedTracker) IsSynced(activityID string) bool {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	_, ok := st.uploaded[activityID]
-	return ok
-}
-
-func (st *syncedTracker) MarkSynced(activityID string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.uploaded[activityID] = time.Now().Format(time.RFC3339)
-	data, _ := json.MarshalIndent(st.uploaded, "", "  ")
-	os.WriteFile(st.path, data, 0o600)
 }
 
 // ---------------------------------------------------------------------------
@@ -96,8 +35,8 @@ func main() {
 	w := a.NewWindow("MyWhoosh2Garmin")
 	w.Resize(fyne.NewSize(720, 700))
 
-	cfg := loadAppConfig()
-	tracker := newSyncedTracker(appConfigDir())
+	cfg := core.LoadConfig(appConfigDir())
+	tracker := core.NewSyncedTracker(appConfigDir())
 
 	// --- MyWhoosh state ---
 	mwClient := mywhoosh.NewClient(appConfigDir())
@@ -130,9 +69,9 @@ func main() {
 	}
 
 	// Wire FIT processing logs into the GUI
-	logFn = func(format string, args ...interface{}) {
+	fitfix.SetLog(func(format string, args ...interface{}) {
 		appendLog(fmt.Sprintf(format, args...))
-	}
+	})
 
 	// Wire MyWhoosh debug logs into the GUI
 	mywhoosh.SetDebugFn(func(format string, args ...interface{}) {
@@ -229,25 +168,23 @@ func main() {
 			}
 			appendLog(fmt.Sprintf("  ✓ Downloaded %d bytes", len(fitData)))
 
-			// 2. Save to temp file
-			tmpDir := os.TempDir()
-			ts := time.Now().Format("20060102_150405")
-			inputPath := filepath.Join(tmpDir, fmt.Sprintf("mw_%s_%s.fit", activity.ID, ts))
-			outputPath := filepath.Join(tmpDir, fmt.Sprintf("mw_%s_%s_fixed.fit", activity.ID, ts))
-
-			if err := os.WriteFile(inputPath, fitData, 0o600); err != nil {
-				appendLog("  ❌ Save temp file failed: " + err.Error())
-				return
-			}
-			defer os.Remove(inputPath)
-			defer os.Remove(outputPath)
-
-			// 3. Fix the FIT file
+			// 2. Fix the FIT file (in memory)
 			appendLog("  🔧 Fixing FIT file…")
-			if err := fixFitFile(inputPath, outputPath); err != nil {
+			fixedData, err := fitfix.FixFit(fitData)
+			if err != nil {
 				appendLog("  ❌ Fix failed: " + err.Error())
 				return
 			}
+
+			// 3. Save fixed file to temp for upload
+			tmpDir := os.TempDir()
+			ts := time.Now().Format("20060102_150405")
+			outputPath := filepath.Join(tmpDir, fmt.Sprintf("mw_%s_%s_fixed.fit", activity.ID, ts))
+			if err := os.WriteFile(outputPath, fixedData, 0o600); err != nil {
+				appendLog("  ❌ Save temp file failed: " + err.Error())
+				return
+			}
+			defer os.Remove(outputPath)
 
 			// 4. Authenticate to Garmin
 			client, err := ensureGarmin()
@@ -343,7 +280,7 @@ func main() {
 			// Persist config
 			cfg.MyWhooshEmail = mwEmailEntry.Text
 			cfg.GarminEmail = garminEmailEntry.Text
-			saveAppConfig(cfg)
+			core.SaveConfig(appConfigDir(), cfg)
 
 			// 1. Login to MyWhoosh (try cached session first)
 			if err := mwClient.Resume(); err == nil {
@@ -476,22 +413,20 @@ func main() {
 					continue
 				}
 
-				// Save temp
-				tmpDir := os.TempDir()
-				ts := time.Now().Format("20060102_150405")
-				inputPath := filepath.Join(tmpDir, fmt.Sprintf("mw_%s_%s.fit", act.ID, ts))
-				outputPath := filepath.Join(tmpDir, fmt.Sprintf("mw_%s_%s_fixed.fit", act.ID, ts))
-
-				if err := os.WriteFile(inputPath, fitData, 0o600); err != nil {
-					appendLog("  ❌ Save failed: " + err.Error())
+				// Fix (in memory)
+				fixedData, err := fitfix.FixFit(fitData)
+				if err != nil {
+					appendLog("  ❌ Fix failed: " + err.Error())
 					failed++
 					continue
 				}
 
-				// Fix
-				if err := fixFitFile(inputPath, outputPath); err != nil {
-					appendLog("  ❌ Fix failed: " + err.Error())
-					os.Remove(inputPath)
+				// Save fixed file to temp
+				tmpDir := os.TempDir()
+				ts := time.Now().Format("20060102_150405")
+				outputPath := filepath.Join(tmpDir, fmt.Sprintf("mw_%s_%s_fixed.fit", act.ID, ts))
+				if err := os.WriteFile(outputPath, fixedData, 0o600); err != nil {
+					appendLog("  ❌ Save failed: " + err.Error())
 					failed++
 					continue
 				}
@@ -500,7 +435,6 @@ func main() {
 				client, err := ensureGarmin()
 				if err != nil {
 					appendLog("  ❌ " + err.Error())
-					os.Remove(inputPath)
 					os.Remove(outputPath)
 					failed++
 					continue
@@ -522,7 +456,6 @@ func main() {
 					appendLog("  ✓ Uploaded")
 				}
 
-				os.Remove(inputPath)
 				os.Remove(outputPath)
 			}
 

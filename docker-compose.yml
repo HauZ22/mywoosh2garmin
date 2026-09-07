@@ -1,0 +1,20 @@
+services:
+  fittogarmin:
+    build: .
+    image: fittogarmin:latest
+    container_name: fittogarmin
+    environment:
+      GARMIN_EMAIL: ${GARMIN_EMAIL:-}
+      GARMIN_PASSWORD: ${GARMIN_PASSWORD:-}
+      MYWHOOSH_EMAIL: ${MYWHOOSH_EMAIL:-}
+      MYWHOOSH_PASSWORD: ${MYWHOOSH_PASSWORD:-}
+      SYNC_DAYS: ${SYNC_DAYS:-10}
+      HTTP_ADDR: ":8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - fittogarmin-data:/data
+    restart: unless-stopped
+
+volumes:
+  fittogarmin-data:

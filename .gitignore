@@ -1,11 +1,22 @@
 # Binaries
 mywhoosh2garmin
 mywhoosh2garmin.exe
+fittogarmin-server
+fittogarmin-server.exe
+*.exe
+*.test
 dist/
 
 # FIT files and sync markers
 *.fit
 *.fit.synced
+
+# Personal workout exports (privacy) — not tracked in git
+/join_workout_player_*.tcx
+
+# Server state (credentials + tokens)
+/data/
+.env
 
 # App config/tokens (contain credentials)
 .mywhoosh2garmin/

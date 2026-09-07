@@ -81,8 +81,11 @@ For each activity, the app will:
 ### Build
 
 ```bash
-# Linux
+# Desktop GUI
 go build -o mywhoosh2garmin .
+
+# Headless web server / webhook daemon (no CGO needed)
+CGO_ENABLED=0 go build -o fittogarmin-server ./cmd/server
 
 # Both platforms (requires mingw-w64)
 ./build.sh
@@ -92,8 +95,93 @@ go build -o mywhoosh2garmin .
 ### Run tests
 
 ```bash
-go test ./...
+# All non-GUI packages (no C-compiler needed)
+go test ./internal/... ./garmin/... ./mywhoosh/... ./cmd/...
 ```
+
+## Docker (Web-App + Webhook Server)
+
+Der Server (`./cmd/server`) stellt die gleiche Sync-Logik als Web-App und
+Headless-Webhook bereit — ohne Desktop/Display. Er holt MyWhoosh-Aktivitäten,
+patcht FIT-Dateien und nimmt zusätzlich gepatchte **TCX-Dateien** (z. B. vom
+[JOIN Cycling](https://www.join.cc/) Workout-Player, der TCX per E-Mail
+verschickt) für den Upload nach Garmin Connect entgegen.
+
+### Starten
+
+```bash
+cp .env.example .env      # Zugangsdaten eintragen
+docker compose up -d
+# Web-App: http://localhost:8080
+```
+
+Alternativ direkt mit `.env`-Angaben:
+
+```bash
+docker run -d --name fittogarmin -p 8080:8080 \
+  -e GARMIN_EMAIL=... -e GARMIN_PASSWORD=... \
+  -e MYWHOOSH_EMAIL=... -e MYWHOOSH_PASSWORD=... \
+  -v fittogarmin-data:/data fittogarmin
+```
+
+Der Datenordner `/data` (Volume) persistiert Tokens (Garmin/MyWhoosh),
+`config.json` und `synced.json`. Garmin/MyWhoosh-Passwörter werden **nur zur
+erstmaligen Anmeldung** benötigt — danach werden die Session-Tokens (> 1 Jahr
+gültig) wiederverwendet. Die Konten lassen sich auch bequem über die Web-App
+konfigurieren.
+
+### Endpunkte
+
+| Methode | Pfad | Beschreibung |
+|---|---|---|
+| GET | `/` | Web-App (Konfig, MyWhoosh-Sync, Datei-Upload, Log) |
+| GET | `/api/status` | Status, letzte Läufe, Log-Tail |
+| POST | `/api/config` | Zugangsdaten / Sichtfenster (Tage) speichern (JSON) |
+| POST | `/api/sync` | MyWhoosh-Sync jetzt starten |
+| POST | `/api/upload` | Datei (`.fit`/`.tcx`) hochladen → patch → Garmin |
+| POST | `/api/webhook/mywhoosh` | Headless-Trigger für den MyWhoosh-Sync |
+| POST | `/api/webhook/upload` | Headless-Dateiempfänger (z. B. JOIN-TCX) |
+
+### Webhook-Beispiele
+
+```bash
+# MyWhoosh-Sync headless anstoßen (z. B. mit einem cron-Job)
+curl -X POST http://localhost:8080/api/webhook/mywhoosh
+
+# JOIN-TCX direkt aus einem Skript senden (nach Mail-Export)
+curl -X POST http://localhost:8080/api/webhook/upload \
+  -F "file=@join_workout_....tcx"
+
+# Oder roher Body mit Dateinamen-Header
+curl -X POST http://localhost:8080/api/webhook/upload \
+  -H "X-Filename: join_workout.tcx" \
+  --data-binary @join_workout_....tcx
+```
+
+Die Jobs laufen asynchron: die Endpunkte antworten sofort mit `202`, der
+Fortschritt erscheint in `/api/status` (und der Web-App). Während ein Sync
+läuft, antworten weitere Jobs mit `409`. Es gibt bewusst keine Authentifizierung
+— halte den Port hinter NAT/firewall oder binde den Server nur an `127.0.0.1`
+(`HTTP_ADDR=127.0.0.1:8080`), wenn du Zugangsdaten drauflegst.
+
+### Umgebungsvariablen
+
+| Variable | Default | Beschreibung |
+|---|---|---|
+| `HTTP_ADDR` | `:8080` | Listen-Adresse |
+| `DATA_DIR` | `./data` | Zustandsverzeichnis (im Container `/data`) |
+| `GARMIN_EMAIL` / `GARMIN_PASSWORD` | — | Garmin-Konto (überschreibt Web-Konfig) |
+| `MYWHOOSH_EMAIL` / `MYWHOOSH_PASSWORD` | — | MyWhoosh-Konto |
+| `SYNC_DAYS` | `10` | MyWhoosh-Sichtfenster (Tage) |
+
+### JOIN Cycling (TCX)
+
+Der JOIN Workout-Player verschickt das Training als TCX-Datei (per E-Mail) —
+Garmin unterstützt das direkte Hochladen nicht. Der Server übernimmt das:
+Er entfernt den JOIN-Author-Block und versieht die Activity mit einem Garmin
+Device-`<Creator>` (Fenix 6S Pro) — dieselbe Spoofing-Logik wie beim
+MyWhoosh-FIT -, sodass Garmin Connect die Einheit vollständig verarbeitet. Die
+Trackdaten (Power, HR, Cadence, Speed) bleiben byte-genau erhalten.
 
 ## How It Works
 

@@ -83,6 +83,18 @@ func (c *Client) Login(email, password string) error {
 // UploadFIT uploads a FIT file to Garmin Connect.
 // Automatically refreshes the OAuth2 token if expired.
 func (c *Client) UploadFIT(filePath string) error {
+	return c.upload(filePath)
+}
+
+// UploadFile uploads a FIT or TCX activity file to Garmin Connect.
+// This is a thin alias over the same upload pipeline.
+func (c *Client) UploadFile(filePath string) error {
+	return c.upload(filePath)
+}
+
+// upload is the shared upload pipeline (FIT and TCX are both accepted by the
+// Garmin Connect upload-service, selected by file extension).
+func (c *Client) upload(filePath string) error {
 	if c.OAuth2 == nil {
 		return fmt.Errorf("not authenticated")
 	}
