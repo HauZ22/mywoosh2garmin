@@ -44,7 +44,11 @@ type logRing struct {
 }
 
 func (r *logRing) add(format string, args ...interface{}) {
-	line := time.Now().Format("15:04:05 ") + fmt.Sprintf(format, args...)
+	r.addLine(fmt.Sprintf(format, args...))
+}
+
+func (r *logRing) addLine(line string) {
+	line = time.Now().Format("15:04:05 ") + line
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.lines = append(r.lines, line)
@@ -117,7 +121,7 @@ func main() {
 	syncer.SetLog(func(format string, args ...interface{}) {
 		line := fmt.Sprintf(format, args...)
 		log.Println(line)
-		ring.add(line)
+		ring.addLine(line)
 	})
 
 	s := &server{dataDir: dataDir, cfg: cfg, syncer: syncer, log: ring}
