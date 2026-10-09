@@ -5,7 +5,10 @@
 package core
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,11 +22,7 @@ import (
 	"mywhoosh2garmin/mywhoosh"
 )
 
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
-
-// LogFn receives format-style log lines.
+// LogFn receives format-style log lines (without trailing newline).
 type LogFn func(format string, args ...interface{})
 
 func noopLog(string, ...interface{}) {}
@@ -36,13 +35,13 @@ func noopLog(string, ...interface{}) {}
 // fields are optional on the desktop where Garmin only needs one interactive
 // login; the server persists them so it can authenticate headlessly.
 type Config struct {
-	MyWhooshEmail    string `json:"mywhoosh_email,omitempty"`
-	MyWhooshPassword string `json:"mywhoosh_password,omitempty"`
-	GarminEmail      string `json:"garmin_email,omitempty"`
-	GarminPassword   string `json:"garmin_password,omitempty"`
-	Days             int    `json:"days,omitempty"`
-	AutoSyncInterval int    `json:"auto_sync_interval,omitempty"`
-	AutoSyncActivatedAt int64 `json:"auto_sync_activated_at,omitempty"`
+	MyWhooshEmail       string `json:"mywhoosh_email,omitempty"`
+	MyWhooshPassword    string `json:"mywhoosh_password,omitempty"`
+	GarminEmail         string `json:"garmin_email,omitempty"`
+	GarminPassword      string `json:"garmin_password,omitempty"`
+	Days                int    `json:"days,omitempty"`
+	AutoSyncInterval    int    `json:"auto_sync_interval,omitempty"`
+	AutoSyncActivatedAt int64  `json:"auto_sync_activated_at,omitempty"`
 }
 
 // DefaultDays is the activity look-back window used when Days is unset.
@@ -80,55 +79,23 @@ func SaveConfig(dir string, cfg Config) error {
 }
 
 // ---------------------------------------------------------------------------
-// Synced-activity tracker
+// Results
 // ---------------------------------------------------------------------------
 
-// SyncedTracker persists the set of already-uploaded activity keys so the
-// same training is never uploaded twice.
-type SyncedTracker struct {
-	mu       sync.Mutex
-	path     string
-	uploaded map[string]string // key → upload timestamp
-}
-
-// NewSyncedTracker loads (or initialises) the tracker stored in dir/synced.json.
-func NewSyncedTracker(dir string) *SyncedTracker {
-	st := &SyncedTracker{
-		path:     filepath.Join(dir, "synced.json"),
-		uploaded: make(map[string]string),
-	}
-	data, err := os.ReadFile(st.path)
-	if err == nil {
-		_ = json.Unmarshal(data, &st.uploaded)
-	}
-	return st
-}
-
-// IsSynced reports whether the given activity key was already uploaded.
-func (st *SyncedTracker) IsSynced(key string) bool {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	_, ok := st.uploaded[key]
-	return ok
-}
-
-// MarkSynced records the given activity key as uploaded.
-func (st *SyncedTracker) MarkSynced(key string) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-	st.uploaded[key] = time.Now().Format(time.RFC3339)
-	data, _ := json.MarshalIndent(st.uploaded, "", "  ")
-	_ = os.WriteFile(st.path, data, 0o600)
-}
-
-// ---------------------------------------------------------------------------
-// Sync results
-// ---------------------------------------------------------------------------
+// Item status values.
+const (
+	StatusUploaded  = "uploaded"
+	StatusDuplicate = "duplicate"
+	StatusSkipped   = "skipped"
+	StatusFailed    = "failed"
+)
 
 // ActivityDisplayItem describes a MyWhoosh activity for display in the UI.
 type ActivityDisplayItem struct {
 	mywhoosh.Activity
-	IsSynced bool `json:"is_synced"`
+	IsSynced   bool       `json:"is_synced"`
+	SyncSource SyncSource `json:"sync_source,omitempty"`
+	SyncedAt   *time.Time `json:"synced_at,omitempty"`
 }
 
 // ItemResult describes the outcome for one activity.
@@ -152,20 +119,47 @@ type Summary struct {
 	Error      string       `json:"error,omitempty"`
 }
 
+func (sum *Summary) add(item ItemResult) {
+	sum.Items = append(sum.Items, item)
+	switch item.Status {
+	case StatusUploaded:
+		sum.Uploaded++
+	case StatusDuplicate:
+		sum.Duplicates++
+	case StatusSkipped:
+		sum.Skipped++
+	default:
+		sum.Failed++
+	}
+}
+
+// ErrGarminAuth marks a failed Garmin login. A sync run stops at the first one
+// instead of retrying the login for every remaining activity.
+var ErrGarminAuth = errors.New("garmin authentication failed")
+
 // ---------------------------------------------------------------------------
 // Syncer
 // ---------------------------------------------------------------------------
 
 // Syncer encapsulates the Garmin + MyWhoosh clients plus persistent state
-// (tokens, sync tracker) for a single data directory.
+// (tokens, sync tracker) for a single data directory. It is safe for
+// concurrent use: network operations are serialised internally.
 type Syncer struct {
 	dataDir string
-	cfg     Config
 	log     LogFn
-
 	tracker *SyncedTracker
-	garmin  *garmin.Client
-	mw      *mywhoosh.Client
+
+	mu          sync.RWMutex // guards cfg and the stale flags
+	cfg         Config
+	mwStale     bool // MyWhoosh account changed → drop cached session
+	garminStale bool
+
+	opMu   sync.Mutex // serialises operations that talk to MyWhoosh/Garmin
+	garmin *garmin.Client
+	mw     *mywhoosh.Client
+
+	knownMu sync.Mutex
+	known   map[string]mywhoosh.Activity // last fetched activities by ID
 }
 
 // New creates a Syncer rooted at dataDir (tokens, config.json, synced.json).
@@ -175,10 +169,11 @@ func New(dataDir string, cfg Config) *Syncer {
 		cfg:     cfg,
 		log:     noopLog,
 		tracker: NewSyncedTracker(dataDir),
+		known:   make(map[string]mywhoosh.Activity),
 	}
 }
 
-// SetLog sets the sync log sink.
+// SetLog sets the sync log sink. Call it before starting any operation.
 func (s *Syncer) SetLog(fn LogFn) {
 	if fn != nil {
 		s.log = fn
@@ -189,173 +184,348 @@ func (s *Syncer) SetLog(fn LogFn) {
 func (s *Syncer) DataDir() string { return s.dataDir }
 
 // Config returns a copy of the current configuration.
-func (s *Syncer) Config() Config { return s.cfg }
+func (s *Syncer) Config() Config {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
 
-// SetConfig replaces the configuration and persists it.
-func (s *Syncer) SetConfig(cfg Config) error {
+// ApplyConfig replaces the in-memory configuration without persisting it
+// (the desktop app uses this to keep passwords out of config.json). Cached
+// sessions are dropped when an account's e-mail changes.
+func (s *Syncer) ApplyConfig(cfg Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.MyWhooshEmail != "" && cfg.MyWhooshEmail != s.cfg.MyWhooshEmail {
+		s.mwStale = true
+	}
+	if s.cfg.GarminEmail != "" && cfg.GarminEmail != s.cfg.GarminEmail {
+		s.garminStale = true
+	}
 	s.cfg = cfg
+}
+
+// SetConfig replaces the configuration and persists it to config.json.
+func (s *Syncer) SetConfig(cfg Config) error {
+	s.ApplyConfig(cfg)
 	return SaveConfig(s.dataDir, cfg)
 }
 
-// Tracker exposes the synced-activity tracker (for the desktop UI).
+// Tracker exposes the synced-activity tracker.
 func (s *Syncer) Tracker() *SyncedTracker { return s.tracker }
 
-// GetMyWhooshActivitiesForDisplay fetches outstanding MyWhoosh activities from
-// the last N days and returns them for display in the UI with their sync status.
-func (s *Syncer) GetMyWhooshActivitiesForDisplay(days int) ([]ActivityDisplayItem, error) {
-	if days <= 0 {
-		days = s.cfg.EffectiveDays()
+// takeStale reads and clears a stale flag.
+func (s *Syncer) takeStale(flag *bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := *flag
+	*flag = false
+	return v
+}
+
+// ---------------------------------------------------------------------------
+// Activity listing and manual marking
+// ---------------------------------------------------------------------------
+
+// ListActivities fetches the MyWhoosh activities from the last N days (0 =
+// configured default) together with their sync status.
+func (s *Syncer) ListActivities(days int) ([]ActivityDisplayItem, error) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+
+	activities, err := s.fetchActivities(days)
+	if err != nil {
+		return nil, err
 	}
 
+	items := make([]ActivityDisplayItem, 0, len(activities))
+	for _, act := range activities {
+		item := ActivityDisplayItem{Activity: act}
+		if e, ok := s.tracker.Entry(act.ID); ok {
+			item.IsSynced = true
+			item.SyncSource = e.Source
+			if !e.At.IsZero() {
+				at := e.At
+				item.SyncedAt = &at
+			}
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+// SetActivitiesSynced marks MyWhoosh activities as already uploaded to Garmin
+// (synced=true), or removes that marker again (synced=false). The marker is
+// stored permanently in synced.json. Returns how many activities changed.
+func (s *Syncer) SetActivitiesSynced(ids []string, synced bool) (int, error) {
+	changed := 0
+	var firstErr error
+	for _, id := range ids {
+		if id == "" || s.tracker.IsSynced(id) == synced {
+			continue
+		}
+		var err error
+		if synced {
+			err = s.tracker.Mark(id, SourceManual, s.knownName(id))
+		} else {
+			err = s.tracker.Unmark(id)
+		}
+		changed++
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if changed > 0 {
+		if synced {
+			s.log("✔ %d Aktivität(en) manuell als hochgeladen markiert", changed)
+		} else {
+			s.log("↩ Markierung bei %d Aktivität(en) entfernt", changed)
+		}
+	}
+	return changed, firstErr
+}
+
+func (s *Syncer) knownName(id string) string {
+	s.knownMu.Lock()
+	defer s.knownMu.Unlock()
+	if act, ok := s.known[id]; ok {
+		return act.DisplayName()
+	}
+	return ""
+}
+
+// mark records an activity as synced and logs if the history can't be saved —
+// a lost marker would otherwise lead to a repeated upload.
+func (s *Syncer) mark(key string, source SyncSource, name string) {
+	if err := s.tracker.Mark(key, source, name); err != nil {
+		s.log("  ⚠ Konnte Sync-Status nicht speichern (%v) — Aktivität könnte erneut hochgeladen werden", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MyWhoosh activity sync
+// ---------------------------------------------------------------------------
+
+// SyncActivity downloads, fixes and uploads one MyWhoosh activity.
+func (s *Syncer) SyncActivity(act mywhoosh.Activity) (ItemResult, error) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if err := s.ensureMyWhoosh(); err != nil {
+		return ItemResult{ID: act.ID, Name: act.DisplayName(), Status: StatusFailed, Message: err.Error()}, err
+	}
+	return s.processActivity(act, false)
+}
+
+// SyncActivityByID looks the activity up in the configured look-back window
+// and uploads it.
+func (s *Syncer) SyncActivityByID(id string) (ItemResult, error) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+
+	activities, err := s.fetchActivities(0)
+	if err != nil {
+		return ItemResult{ID: id, Status: StatusFailed, Message: err.Error()}, err
+	}
+	for _, act := range activities {
+		if act.ID == id {
+			return s.processActivity(act, false)
+		}
+	}
+	err = fmt.Errorf("activity %s not found", id)
+	return ItemResult{ID: id, Status: StatusFailed, Message: "Aktivität nicht gefunden"}, err
+}
+
+// SyncMyWhoosh fetches outstanding MyWhoosh activities from the last N days
+// (0 = configured default), fixes their FIT files and uploads them to Garmin
+// Connect. With isAutoSync, activities older than the auto-sync activation
+// time are marked as synced instead of uploaded.
+func (s *Syncer) SyncMyWhoosh(days int, isAutoSync bool) (Summary, error) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+
+	summary := Summary{StartedAt: time.Now()}
+	finish := func(err error) (Summary, error) {
+		summary.FinishedAt = time.Now()
+		if err != nil {
+			summary.Error = err.Error()
+		}
+		return summary, err
+	}
+
+	activities, err := s.fetchActivities(days)
+	if err != nil {
+		return finish(err)
+	}
+
+	summary.Total = len(activities)
+	if summary.Total == 0 {
+		s.log("Keine Aktivitäten im gewählten Zeitraum.")
+		return finish(nil)
+	}
+	s.log("✓ %d Aktivitäten gefunden", summary.Total)
+
+	for i, act := range activities {
+		s.log("[%d/%d] %s", i+1, summary.Total, act.DisplayName())
+		item, err := s.processActivity(act, isAutoSync)
+		summary.add(item)
+		if errors.Is(err, ErrGarminAuth) {
+			s.log("✖ Garmin-Login fehlgeschlagen — Sync wird abgebrochen")
+			return finish(err)
+		}
+	}
+
+	s.log("✓ Sync abgeschlossen — %d hochgeladen, %d Duplikate, %d übersprungen, %d fehlgeschlagen",
+		summary.Uploaded, summary.Duplicates, summary.Skipped, summary.Failed)
+	return finish(nil)
+}
+
+// fetchActivities lists recent activities, logging in again once if the cached
+// session was rejected. The caller must hold opMu.
+func (s *Syncer) fetchActivities(days int) ([]mywhoosh.Activity, error) {
+	cfg := s.Config()
+	if days <= 0 {
+		days = cfg.EffectiveDays()
+	}
 	if err := s.ensureMyWhoosh(); err != nil {
 		return nil, err
 	}
-	s.log("MyWhoosh Aktivitäten (letzte %d Tage) abrufen…", days)
+
+	s.log("MyWhoosh-Aktivitäten (letzte %d Tage) abrufen…", days)
 	activities, err := s.mw.GetRecentActivities(days)
-	if err != nil {
-		s.log("  ❌ Token evtl. abgelaufen, neuer Login…")
-		if loginErr := s.mw.Login(s.cfg.MyWhooshEmail, s.cfg.MyWhooshPassword); loginErr == nil {
-			activities, err = s.mw.GetRecentActivities(days)
+	if err != nil && cfg.MyWhooshEmail != "" && cfg.MyWhooshPassword != "" {
+		s.log("  Token evtl. abgelaufen, neuer Login…")
+		if loginErr := s.mw.Login(cfg.MyWhooshEmail, cfg.MyWhooshPassword); loginErr != nil {
+			return nil, fmt.Errorf("MyWhoosh login failed: %w", loginErr)
 		}
+		activities, err = s.mw.GetRecentActivities(days)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("Aktivitäten abrufen fehlgeschlagen: %w", err)
 	}
 
-	var displayItems []ActivityDisplayItem
+	s.knownMu.Lock()
 	for _, act := range activities {
-		displayItems = append(displayItems, ActivityDisplayItem{
-			Activity: act,
-			IsSynced: s.tracker.IsSynced(act.ID),
-		})
+		s.known[act.ID] = act
 	}
-	return displayItems, nil
+	s.knownMu.Unlock()
+	return activities, nil
 }
 
-// SyncSingleMyWhooshActivity downloads, fixes, and uploads a single MyWhoosh activity.
-func (s *Syncer) SyncSingleMyWhooshActivity(activityID string) (ItemResult, error) {
-	if err := s.ensureMyWhoosh(); err != nil {
-		return ItemResult{ID: activityID, Status: "failed", Message: err.Error()}, err
-	}
-
-	// Find the activity by ID (we might have fetched more than requested days originally)
-	// For now, let's refetch recent activities to ensure we have it.
-	// A more efficient way would be to get all activities and then filter, but for now this is simpler.
-	activities, err := s.mw.GetRecentActivities(s.cfg.EffectiveDays())
-	if err != nil {
-		return ItemResult{ID: activityID, Status: "failed", Message: fmt.Sprintf("Aktivitäten abrufen fehlgeschlagen: %v", err)}, err
-	}
-
-	var targetActivity *mywhoosh.Activity
-	for _, act := range activities {
-		if act.ID == activityID {
-			targetActivity = &act
-			break
-		}
-	}
-
-	if targetActivity == nil {
-		return ItemResult{ID: activityID, Status: "failed", Message: "Aktivität nicht gefunden"}, fmt.Errorf("activity %s not found", activityID)
-	}
-
-	return s.processAndUploadMyWhooshActivity(*targetActivity, false)
-}
-
-func (s *Syncer) processAndUploadMyWhooshActivity(act mywhoosh.Activity, isAutoSync bool) (ItemResult, error) {
+// processActivity uploads one activity unless it is already marked as synced.
+// The returned error is non-nil exactly when item.Status is StatusFailed. The
+// caller must hold opMu.
+func (s *Syncer) processActivity(act mywhoosh.Activity, isAutoSync bool) (ItemResult, error) {
 	item := ItemResult{ID: act.ID, Name: act.DisplayName()}
+	fail := func(msg string, err error) (ItemResult, error) {
+		item.Status, item.Message = StatusFailed, msg+err.Error()
+		return item, err
+	}
 
-	if s.tracker.IsSynced(act.ID) {
-		item.Status = "skipped"
+	if e, ok := s.tracker.Entry(act.ID); ok {
+		item.Status = StatusSkipped
 		item.Message = "Bereits synchronisiert"
+		if e.Source == SourceManual {
+			item.Message = "Manuell als hochgeladen markiert"
+		}
 		return item, nil
 	}
-    
-    // Safety check for auto-sync: skip activities before activation
-    if isAutoSync && s.cfg.AutoSyncActivatedAt > 0 && int64(act.Date) < s.cfg.AutoSyncActivatedAt {
-        s.log("  [Auto-Sync] Überspringe alte Aktivität (vor Aktivierung): %s", act.DisplayName())
-        s.tracker.MarkSynced(act.ID) // Mark as synced silently
-        item.Status = "skipped"
-        item.Message = "Vor Auto-Sync Aktivierung"
-        return item, nil
-    }
+
+	// Safety net for auto-sync: never upload rides older than the moment it was switched on.
+	if cfg := s.Config(); isAutoSync && cfg.AutoSyncActivatedAt > 0 && act.DateUnix() < cfg.AutoSyncActivatedAt {
+		s.log("  [Auto-Sync] Überspringe alte Aktivität (vor Aktivierung): %s", act.DisplayName())
+		s.mark(act.ID, SourceAutoSkip, act.DisplayName())
+		item.Status = StatusSkipped
+		item.Message = "Vor Auto-Sync Aktivierung"
+		return item, nil
+	}
 
 	s.log("▶ %s (%s)", act.DisplayName(), act.FormattedDate())
 
-	// Download FIT from MyWhoosh
 	fileID := act.ActivityFileID
 	if fileID == "" {
 		fileID = act.ID
 	}
 	fitData, err := s.mw.DownloadFitFile(fileID)
 	if err != nil {
-		item.Status, item.Message = "failed", "Download fehlgeschlagen: "+err.Error()
-		return item, err
+		return fail("Download fehlgeschlagen: ", err)
 	}
 	s.log("  ✓ %d Bytes heruntergeladen", len(fitData))
 
-	// Fix the FIT file (in memory)
-	fixed, err := fitfix.FixFit(fitData)
+	fixed, err := fitfix.FixFit(fitData, fitfix.LogFunc(s.log))
 	if err != nil {
-		item.Status, item.Message = "failed", "FIT-Fix fehlgeschlagen: "+err.Error()
-		return item, err
+		return fail("FIT-Fix fehlgeschlagen: ", err)
 	}
 
-	// Authenticate to Garmin
-	if err := s.EnsureGarmin(); err != nil {
-		item.Status, item.Message = "failed", "Garmin-Authentifizierung fehlgeschlagen: "+err.Error()
-		return item, err
+	return s.uploadFixed(&item, act.ID, "mw_"+act.ID+".fit", fixed, act.DisplayName())
+}
+
+// uploadFixed sends patched bytes to Garmin and records the outcome under key.
+func (s *Syncer) uploadFixed(item *ItemResult, key, fileName string, data []byte, name string) (ItemResult, error) {
+	if err := s.ensureGarmin(); err != nil {
+		item.Status, item.Message = StatusFailed, "Garmin-Authentifizierung fehlgeschlagen: "+err.Error()
+		return *item, fmt.Errorf("%w: %v", ErrGarminAuth, err)
 	}
 
-	// Upload to Garmin
-	path, err := writeTempFile("mw_"+act.ID+".fit", fixed)
+	path, err := writeTempFile(fileName, data)
 	if err != nil {
-		item.Status, item.Message = "failed", "Temp-Datei erstellen fehlgeschlagen: "+err.Error()
-		return item, err
+		item.Status, item.Message = StatusFailed, "Temp-Datei erstellen fehlgeschlagen: "+err.Error()
+		return *item, err
 	}
 	defer os.Remove(path)
 
 	s.log("  ⬆ Upload zu Garmin Connect…")
-	if err := s.garmin.UploadFIT(path); err != nil {
-		if strings.Contains(err.Error(), "duplicate") {
-			s.log("  ⚠ Bereits auf Garmin (Duplikat)")
-			item.Status = "duplicate"
-			s.tracker.MarkSynced(act.ID)
-		} else {
-			item.Status, item.Message = "failed", "Upload fehlgeschlagen: "+err.Error()
-		}
-	} else {
+	switch err := s.garmin.Upload(path); {
+	case err == nil:
 		s.log("  ✓ Hochgeladen")
-		item.Status = "uploaded"
-		s.tracker.MarkSynced(act.ID)
+		item.Status = StatusUploaded
+		s.mark(key, SourceUpload, name)
+	case errors.Is(err, garmin.ErrDuplicate):
+		s.log("  ⚠ Bereits auf Garmin (Duplikat) — als hochgeladen gemerkt")
+		item.Status = StatusDuplicate
+		s.mark(key, SourceDuplicate, name)
+	default:
+		item.Status, item.Message = StatusFailed, "Upload fehlgeschlagen: "+err.Error()
+		return *item, err
 	}
-	return item, nil
+	return *item, nil
 }
 
 // ---------------------------------------------------------------------------
-// Garmin authentication
+// Authentication
 // ---------------------------------------------------------------------------
 
 // EnsureGarmin authenticates to Garmin Connect, resuming a cached session,
 // refreshing the OAuth2 token, or performing a fresh login when credentials
 // are configured. A valid session is cached in dataDir for reuse.
 func (s *Syncer) EnsureGarmin() error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.ensureGarmin()
+}
+
+func (s *Syncer) ensureGarmin() error {
+	if s.takeStale(&s.garminStale) {
+		s.garmin = nil
+		garmin.ClearTokens(s.dataDir)
+	}
 	if s.garmin != nil && s.garmin.OAuth2 != nil && !s.garmin.OAuth2.Expired() {
 		return nil
 	}
 
 	client := garmin.NewClient(s.dataDir)
+	client.Logf = s.log
 	if err := client.Resume(); err == nil {
 		s.garmin = client
 		return nil
 	}
 
-	email, password := s.cfg.GarminEmail, s.cfg.GarminPassword
-	if email == "" || password == "" {
+	cfg := s.Config()
+	if cfg.GarminEmail == "" || cfg.GarminPassword == "" {
 		return fmt.Errorf("Garmin ist nicht eingerichtet — E-Mail & Passwort erforderlich")
 	}
 
 	s.log("Garmin Login…")
-	if err := client.Login(email, password); err != nil {
+	if err := client.Login(cfg.GarminEmail, cfg.GarminPassword); err != nil {
 		return fmt.Errorf("Garmin login failed: %w", err)
 	}
 	s.garmin = client
@@ -367,152 +537,78 @@ func (s *Syncer) ensureMyWhoosh() error {
 	if s.mw == nil {
 		s.mw = mywhoosh.NewClient(s.dataDir)
 	}
+	if s.takeStale(&s.mwStale) {
+		s.mw.ClearToken()
+	}
 	if s.mw.Resume() == nil {
 		return nil
 	}
 
-	email, password := s.cfg.MyWhooshEmail, s.cfg.MyWhooshPassword
-	if email == "" || password == "" {
+	cfg := s.Config()
+	if cfg.MyWhooshEmail == "" || cfg.MyWhooshPassword == "" {
 		return fmt.Errorf("MyWhoosh ist nicht eingerichtet — E-Mail & Passwort erforderlich")
 	}
 	s.log("MyWhoosh Login…")
-	if err := s.mw.Login(email, password); err != nil {
+	if err := s.mw.Login(cfg.MyWhooshEmail, cfg.MyWhooshPassword); err != nil {
 		return fmt.Errorf("MyWhoosh login failed: %w", err)
 	}
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// MyWhoosh activity sync
-// ---------------------------------------------------------------------------
-
-// SyncMyWhoosh fetches outstanding MyWhoosh activities from the last N days,
-// fixes their FIT files and uploads them to Garmin Connect.
-func (s *Syncer) SyncMyWhoosh(days int, isAutoSync bool) (Summary, error) {
-	if days <= 0 {
-		days = s.cfg.EffectiveDays()
-	}
-	summary := Summary{StartedAt: time.Now()}
-
-	if err := s.ensureMyWhoosh(); err != nil {
-		summary.FinishedAt = time.Now()
-		summary.Error = err.Error()
-		return summary, err
-	}
-	s.log("MyWhoosh Aktivitäten (letzte %d Tage) abrufen…", days)
-	activities, err := s.mw.GetRecentActivities(days)
-	if err != nil {
-		s.log("  ❌ Token evtl. abgelaufen, neuer Login…")
-		if loginErr := s.mw.Login(s.cfg.MyWhooshEmail, s.cfg.MyWhooshPassword); loginErr == nil {
-			activities, err = s.mw.GetRecentActivities(days)
-		}
-	}
-	if err != nil {
-		summary.FinishedAt = time.Now()
-		summary.Error = fmt.Sprintf("Aktivitäten abrufen fehlgeschlagen: %v", err)
-		return summary, err
-	}
-
-	summary.Total = len(activities)
-	if summary.Total == 0 {
-		summary.FinishedAt = time.Now()
-		s.log("Keine Aktivitäten in den letzten %d Tagen.", days)
-		return summary, nil
-	}
-	s.log("✓ %d Aktivitäten gefunden", summary.Total)
-
-	for i, act := range activities {
-		s.log("[%d/%d] %s", i+1, summary.Total, act.DisplayName())
-		item, err := s.processAndUploadMyWhooshActivity(act, isAutoSync)
-		if err != nil && item.Status != "duplicate" {
-			summary.Failed++
-		} else if item.Status == "duplicate" {
-			summary.Duplicates++
-		} else if item.Status == "uploaded" {
-			summary.Uploaded++
-		}
-		summary.Items = append(summary.Items, item)
-	}
-
-	summary.FinishedAt = time.Now()
-	s.log("✓ Sync abgeschlossen — %d hochgeladen, %d Duplikate, %d fehlgeschlagen",
-		summary.Uploaded, summary.Duplicates, summary.Failed)
-	return summary, nil
-}
-
-// ---------------------------------------------------------------------------
 // Generic file upload (FIT or TCX)
 // ---------------------------------------------------------------------------
 
-// UploadFileBytes patches and uploads a single activity file. name must carry
-// a .fit or .tcx extension. Returns the item status, message and dedup key.
-func (s *Syncer) UploadFileBytes(name string, data []byte) (ItemResult, error) {
-	lower := strings.ToLower(name)
-	item := ItemResult{Name: name}
-
-	hash := tcx.ContentHash(data)
-	if strings.HasSuffix(lower, ".tcx") || strings.HasSuffix(lower, ".xml") {
-		if s.tracker.IsSynced(hash) {
-			item.Status = "duplicate"
-			return item, nil
-		}
-		fixed, err := tcx.FixTcx(data)
-		if err != nil {
-			return ItemResult{Name: name, Status: "failed", Message: "TCX-Fix: " + err.Error()}, err
-		}
-		return s.uploadPatched(name, fixed, &item, hash)
-	}
-
-	if strings.HasSuffix(lower, ".fit") {
-		if s.tracker.IsSynced(hash) {
-			item.Status = "duplicate"
-			return item, nil
-		}
-		fixed, err := fitfix.FixFit(data)
-		if err != nil {
-			return ItemResult{Name: name, Status: "failed", Message: "FIT-Fix: " + err.Error()}, err
-		}
-		return s.uploadPatched(name, fixed, &item, hash)
-	}
-
-	return ItemResult{Name: name, Status: "failed", Message: "Unbekanntes Format (nutze .fit oder .tcx)"},
-		fmt.Errorf("unsupported file format: %q", name)
+// contentHash is the dedup key for uploaded files: SHA-256 of the raw bytes.
+func contentHash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
-func (s *Syncer) uploadPatched(tmpName string, data []byte, item *ItemResult, key string) (ItemResult, error) {
-	if err := s.EnsureGarmin(); err != nil {
-		return ItemResult{Name: item.Name, Status: "failed", Message: err.Error()}, err
-	}
+// UploadFileBytes patches and uploads a single activity file. name must carry
+// a .fit, .tcx or .xml extension. Files whose content was uploaded before are
+// reported as duplicates without contacting Garmin.
+func (s *Syncer) UploadFileBytes(name string, data []byte) (ItemResult, error) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
 
-	path, err := writeTempFile(tmpName, data)
-	if err != nil {
-		return ItemResult{Name: item.Name, Status: "failed", Message: "Temp: " + err.Error()}, err
-	}
-	defer os.Remove(path)
+	item := ItemResult{Name: name}
 
-	s.log("  ⬆ Upload %s…", tmpName)
-	if err := s.garmin.UploadFile(path); err != nil {
-		if strings.Contains(err.Error(), "duplicate") {
-			s.log("  ⚠ Bereits auf Garmin (duplicate)")
-			item.Status = "duplicate"
-			s.tracker.MarkSynced(key)
-			return *item, nil
+	var fixed []byte
+	var err error
+	var ext string
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".tcx", ".xml":
+		ext = ".tcx"
+		if s.tracker.IsSynced(contentHash(data)) {
+			item.Status = StatusDuplicate
+			return item, nil
 		}
-		item.Status = "failed"
-		item.Message = err.Error()
-		return *item, err
+		if fixed, err = tcx.FixTcx(data); err != nil {
+			return ItemResult{Name: name, Status: StatusFailed, Message: "TCX-Fix: " + err.Error()}, err
+		}
+	case ".fit":
+		ext = ".fit"
+		if s.tracker.IsSynced(contentHash(data)) {
+			item.Status = StatusDuplicate
+			return item, nil
+		}
+		if fixed, err = fitfix.FixFit(data, fitfix.LogFunc(s.log)); err != nil {
+			return ItemResult{Name: name, Status: StatusFailed, Message: "FIT-Fix: " + err.Error()}, err
+		}
+	default:
+		return ItemResult{Name: name, Status: StatusFailed, Message: "Unbekanntes Format (nutze .fit oder .tcx)"},
+			fmt.Errorf("unsupported file format: %q", name)
 	}
-	s.log("  ✓ Hochgeladen")
-	item.Status = "uploaded"
-	s.tracker.MarkSynced(key)
-	return *item, nil
+
+	return s.uploadFixed(&item, contentHash(data), "upload"+ext, fixed, name)
 }
 
 // writeTempFile stores bytes in a temp file for the Garmin multipart upload.
 // The random suffix is inserted before the file extension so the uploaded
 // file keeps a valid .fit/.tcx extension that Garmin can detect.
 func writeTempFile(name string, data []byte) (string, error) {
-	f, err := os.CreateTemp("", "fittogarmin-*"+filepath.Ext(name))
+	f, err := os.CreateTemp("", "mywhoosh2garmin-*"+filepath.Ext(name))
 	if err != nil {
 		return "", err
 	}

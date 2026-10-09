@@ -1,17 +1,16 @@
 # Binaries
 mywhoosh2garmin
 mywhoosh2garmin.exe
-fittogarmin-server
-fittogarmin-server.exe
+mywhoosh2garmin-server
+mywhoosh2garmin-server.exe
 *.exe
 *.test
 dist/
+bin/
 
-# FIT files and sync markers
+# Personal workout exports (privacy)
 *.fit
 *.fit.synced
-
-# Personal workout exports (privacy) — not tracked in git
 /join_workout_player_*.tcx
 
 # Server state (credentials + tokens)
@@ -22,15 +21,10 @@ dist/
 .mywhoosh2garmin/
 .garth/
 
-# Test artifacts
-/tmp/
-
-# IDE
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *~
-
-# OS
 .DS_Store
 Thumbs.db

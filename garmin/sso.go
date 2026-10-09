@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dghubble/oauth1"
@@ -224,8 +225,23 @@ func ExchangeForOAuth2(oauth1Token *OAuth1Token) (*OAuth2Token, error) {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+var (
+	consumerMu     sync.Mutex
+	cachedConsumer *oauthConsumer
+)
+
+// fetchConsumer returns the shared OAuth consumer key/secret. It is downloaded
+// once per process and cached, so token refreshes don't depend on that
+// third-party S3 bucket being reachable every time.
 func fetchConsumer() (*oauthConsumer, error) {
-	resp, err := http.Get(oauthConsumerURL)
+	consumerMu.Lock()
+	defer consumerMu.Unlock()
+	if cachedConsumer != nil {
+		return cachedConsumer, nil
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(oauthConsumerURL)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +253,8 @@ func fetchConsumer() (*oauthConsumer, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&c); err != nil {
 		return nil, err
 	}
-	return &c, nil
+	cachedConsumer = &c
+	return cachedConsumer, nil
 }
 
 func getOAuth1Token(consumer *oauthConsumer, ticket, domain string) (*OAuth1Token, error) {

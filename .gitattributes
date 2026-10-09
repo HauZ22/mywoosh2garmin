@@ -1,0 +1,4 @@
+# Einheitliche Zeilenenden (LF), damit gofmt/CI auch auf Windows-Checkouts sauber bleiben.
+* text=auto eol=lf
+*.jpg binary
+*.png binary

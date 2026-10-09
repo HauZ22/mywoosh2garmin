@@ -1,226 +1,178 @@
 # MyWhoosh2Garmin
 
-A single-executable GUI app that syncs your [MyWhoosh](https://www.mywhoosh.com/) indoor cycling activities to [Garmin Connect](https://connect.garmin.com/) — with full training effect, VO2max, and performance stats support.
+Überträgt deine [MyWhoosh](https://www.mywhoosh.com/)-Indoor-Fahrten nach [Garmin Connect](https://connect.garmin.com/) — inklusive **Training Effect**, **VO2max**, **Training Load** und **Training Status**.
 
-No need to run this on the same PC as MyWhoosh — the app downloads activities directly from your MyWhoosh account.
+Die Fahrten werden direkt aus deinem MyWhoosh-Konto geladen. Das Programm muss also nicht auf dem PC laufen, auf dem MyWhoosh installiert ist.
 
+Es gibt zwei Varianten:
 
-## Why?
+| Variante | Für wen | Bezug |
+|---|---|---|
+| **Windows-App** (Desktop-GUI) | Du willst gelegentlich per Klick synchronisieren | [Releases](../../releases) → `mywhoosh2garmin-windows-amd64.exe` |
+| **Docker** (Web-App + Webhooks + Auto-Sync) | Du hast einen Server/NAS/Raspberry Pi und willst, dass es von selbst läuft | Fertiges Image aus der GitHub Container Registry |
 
-MyWhoosh exports FIT files, but they have issues that prevent Garmin from fully processing them:
+## Warum überhaupt?
 
-- **Missing averages** — average power, heart rate, and cadence are not set in the session data
-- **Bogus temperature** — every record contains a fake temperature reading
-- **Unknown device** — Garmin ignores training effect and VO2max from unknown manufacturers
+MyWhoosh exportiert FIT-Dateien, die Garmin nicht vollständig verarbeitet:
 
-MyWhoosh2Garmin fixes all of this automatically:
-
-| Problem | Fix |
+| Problem | Lösung |
 |---|---|
-| Missing avg power / HR / cadence | Calculated from ride records |
-| Fake temperature data | Stripped from all records |
-| MyWhoosh device identity | Spoofed to Garmin Fenix 6S Pro |
+| Durchschnittsleistung / -puls / -kadenz fehlen | werden aus den Aufzeichnungen berechnet |
+| Falsche Temperaturwerte in jedem Datensatz | werden entfernt |
+| Unbekanntes Gerät → Garmin ignoriert Training Effect & VO2max | Gerät wird als Garmin Fenix 6S Pro eingetragen |
 
-The result: your indoor rides show up on Garmin Connect just like a native Garmin recording, complete with **Training Effect**, **VO2max updates**, **Training Load**, and **Training Status**.
+## Windows-App
 
-## Download
+1. `mywhoosh2garmin-windows-amd64.exe` von der [Releases](../../releases)-Seite laden und starten (keine Installation nötig).
+2. MyWhoosh- und Garmin-Zugangsdaten eingeben. Passwörter werden nur für die erste Anmeldung gebraucht und **nicht gespeichert**; danach wird ein Session-Token unter `%USERPROFILE%\.mywhoosh2garmin\` wiederverwendet (Garmin: bis zu einem Jahr).
+3. **Fetch Activities** lädt die Fahrten der letzten Tage (Standard 10).
+4. Pro Fahrt **Upload**, oder **Upload All** für alle neuen.
 
-Grab the latest release for your platform from the [**Releases**](../../releases) page:
+### Fahrt schon auf Garmin? Dauerhaft als hochgeladen markieren
 
-| Platform | File |
-|---|---|
-| Windows | `mywhoosh2garmin-windows-amd64.exe` |
-| Linux | `mywhoosh2garmin-linux-amd64` |
+Wurde eine Fahrt bereits auf anderem Weg (z. B. von Hand oder mit einem anderen Tool) zu Garmin übertragen, erkennt das Programm das nicht immer — Garmin sieht die korrigierte Datei dann nicht als Duplikat. So verhinderst du eine doppelte Aktivität:
 
-No installation needed — just download and run.
+- **Already on Garmin** neben der Fahrt: merkt sie sich dauerhaft als hochgeladen. Sie wird nie wieder hochgeladen, auch nicht von „Upload All“ oder dem Auto-Sync.
+- **Mark all open as uploaded**: markiert auf einmal alle noch offenen Fahrten der Liste.
+- **Undo**: nimmt die Markierung wieder weg.
 
-## How to Use
+Die Markierungen stehen in `synced.json` im Datenordner (Windows: `%USERPROFILE%\.mywhoosh2garmin\`, Docker: Volume `/data`) und überleben Neustarts und Updates.
 
-### 1. Enter MyWhoosh credentials
+## Docker
 
-Enter your **MyWhoosh email** and **password**. These are used to log in to the MyWhoosh API and fetch your activity list.
-
-After the first login, the session token is cached locally (`~/.mywhoosh2garmin/`) so you won't need to enter your password again unless the token expires.
-
-### 2. Enter Garmin credentials
-
-Enter your **Garmin Connect email** and **password**. These are only sent directly to Garmin's SSO servers — never stored or sent anywhere else.
-
-After the first login, a session token is cached locally (`~/.mywhoosh2garmin/`) and reused for up to a year. You won't need to enter your password again unless the token expires.
-
-### 3. Fetch Activities
-
-Click **📋 Fetch Activities (last 10 days)** and the app will:
-
-1. Log in to your MyWhoosh account (or resume a cached session)
-2. Fetch your activities from the last 10 days
-3. Display them in a list showing date, title, distance, duration, power, and heart rate — with an upload button next to each one
-
-### 4. Upload to Garmin
-
-You can either:
-
-- Click **⬆ Upload** next to individual activities to upload them one by one
-- Click **⬆ Upload All to Garmin** to upload all unsynced activities at once
-
-For each activity, the app will:
-
-1. Download the FIT file from MyWhoosh
-2. Fix averages, strip temperature, spoof device identity
-3. Upload to Garmin Connect
-4. Mark the activity as synced so it won't be uploaded again
-
-## Building from Source
-
-### Prerequisites
-
-- Go 1.24+
-- GCC (for Fyne/CGO)
-- Windows cross-compile from Linux: `mingw-w64`, `libgl-dev`, `xorg-dev`, `libxxf86vm-dev`
-
-### Build
-
-```bash
-# Desktop GUI
-go build -o mywhoosh2garmin .
-
-# Headless web server / webhook daemon (no CGO needed)
-CGO_ENABLED=0 go build -o fittogarmin-server ./cmd/server
-
-# Both platforms (requires mingw-w64)
-./build.sh
-# Output in dist/
-```
-
-### Run tests
-
-```bash
-# All non-GUI packages (no C-compiler needed)
-go test ./internal/... ./garmin/... ./mywhoosh/... ./cmd/...
-```
-
-## Docker (Web-App + Webhook Server)
-
-Der Server (`./cmd/server`) stellt die gleiche Sync-Logik als Web-App und
-Headless-Webhook bereit — ohne Desktop/Display. Er holt MyWhoosh-Aktivitäten,
-patcht FIT-Dateien und nimmt zusätzlich gepatchte **TCX-Dateien** (z. B. vom
-[JOIN Cycling](https://www.join.cc/) Workout-Player, der TCX per E-Mail
-verschickt) für den Upload nach Garmin Connect entgegen.
+Das Image wird automatisch gebaut und in der GitHub Container Registry bereitgestellt (`linux/amd64` und `linux/arm64`). Du baust nichts lokal — du gibst in der `docker-compose.yml` nur an, welche Version laufen soll.
 
 ### Starten
 
 ```bash
-cp .env.example .env      # Zugangsdaten eintragen
+# Nur diese zwei Dateien werden gebraucht:
+curl -O https://raw.githubusercontent.com/HauZ22/mywoosh2garmin/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/HauZ22/mywoosh2garmin/main/.env.example
+
 docker compose up -d
 # Web-App: http://localhost:8080
 ```
 
-Alternativ direkt mit `.env`-Angaben:
+Die Zugangsdaten kannst du in `.env` eintragen oder bequem in der Web-App eingeben.
 
-```bash
-docker run -d --name fittogarmin -p 8080:8080 \
-  -e GARMIN_EMAIL=... -e GARMIN_PASSWORD=... \
-  -e MYWHOOSH_EMAIL=... -e MYWHOOSH_PASSWORD=... \
-  -v fittogarmin-data:/data fittogarmin
+### Version wählen
+
+In `.env`:
+
+```ini
+IMAGE_TAG=latest   # zuletzt veröffentlichte Version (Standard)
+IMAGE_TAG=1.2.3    # genau diese Version — empfohlen für ein stabiles Setup
+IMAGE_TAG=edge     # aktueller Stand des main-Branches (Vorabversion)
 ```
 
-Der Datenordner `/data` (Volume) persistiert Tokens (Garmin/MyWhoosh),
-`config.json` und `synced.json`. Garmin/MyWhoosh-Passwörter werden **nur zur
-erstmaligen Anmeldung** benötigt — danach werden die Session-Tokens (> 1 Jahr
-gültig) wiederverwendet. Die Konten lassen sich auch bequem über die Web-App
-konfigurieren.
+### Aktualisieren
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+Tokens, Konfiguration und die Sync-Historie liegen im Volume `fittogarmin-data` und bleiben dabei erhalten.
+
+> **Einmalig nötig (Repo-Besitzer):** GitHub legt neue Pakete als *privat* an. Unter *GitHub → Profil → Packages → mywhoosh2garmin → Package settings → Change visibility* auf **Public** stellen, sonst kann `docker compose pull` das Image nicht ohne Login laden.
+
+### Lokal aus dem Quellcode bauen (optional)
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+### Zugriffsschutz
+
+Die Web-App kann Zugangsdaten verwalten und Uploads auslösen. Setze deshalb in `.env` ein `AUTH_PASSWORD` (Benutzer: `AUTH_USER`, Standard `admin`), sobald der Port nicht nur lokal erreichbar ist — oder binde ihn in der Compose-Datei an `127.0.0.1:8080:8080`. Webhook-Aufrufe brauchen dann `curl -u admin:passwort …`. Für Zugriff aus dem Internet gehört ein Reverse-Proxy mit HTTPS davor.
+
+### Web-App
+
+- **Aktivitäten laden**: Fahrten der letzten Tage mit Status *Neu / Hochgeladen / Auf Garmin vorhanden / Manuell markiert*.
+- Pro Fahrt **Upload** oder **Schon auf Garmin** (dauerhaft als hochgeladen merken); bei bereits markierten Fahrten **Markierung entfernen**.
+- **Alle offenen als hochgeladen markieren** und **Alle neuen synchronisieren**.
+- **Auto-Sync**: Intervall in Minuten (0 = aus). Beim Einschalten werden ältere Fahrten nie automatisch hochgeladen, sondern nur als „übersprungen“ gemerkt.
+- **Datei hochladen**: FIT oder TCX (z. B. vom [JOIN Cycling](https://www.join.cc/) Workout-Player) per Drag & Drop.
 
 ### Endpunkte
 
 | Methode | Pfad | Beschreibung |
 |---|---|---|
-| GET | `/` | Web-App (Konfig, MyWhoosh-Sync, Datei-Upload, Log) |
-| GET | `/api/status` | Status, letzte Läufe, Log-Tail |
-| POST | `/api/config` | Zugangsdaten / Sichtfenster (Tage) speichern (JSON) |
-| POST | `/api/sync` | MyWhoosh-Sync jetzt starten |
-| POST | `/api/upload` | Datei (`.fit`/`.tcx`) hochladen → patch → Garmin |
-| POST | `/api/webhook/mywhoosh` | Headless-Trigger für den MyWhoosh-Sync |
-| POST | `/api/webhook/upload` | Headless-Dateiempfänger (z. B. JOIN-TCX) |
+| GET | `/` | Web-App |
+| GET | `/healthz` | Health-Check (immer ohne Login) |
+| GET | `/api/status` | Status, letzte Läufe, Log |
+| POST | `/api/config` | Zugangsdaten / Zeitfenster / Auto-Sync speichern (JSON) |
+| GET | `/api/activities?days=N` | Fahrten mit Sync-Status |
+| POST | `/api/activities/mark` | Fahrten markieren: `{"ids":["…"],"synced":true}` (`false` = Markierung entfernen) |
+| POST | `/api/sync` · `/api/webhook/mywhoosh` | Sync aller neuen Fahrten starten |
+| POST | `/api/sync/activity` | Eine Fahrt hochladen: `{"id":"…"}` |
+| POST | `/api/upload` · `/api/webhook/upload` | Datei (`.fit`/`.tcx`) patchen und hochladen |
 
-### Webhook-Beispiele
+Jobs laufen asynchron: Die Endpunkte antworten sofort mit `202`; der Fortschritt steht in `/api/status`. Läuft schon ein Job, kommt `409`.
 
 ```bash
-# MyWhoosh-Sync headless anstoßen (z. B. mit einem cron-Job)
+# MyWhoosh-Sync per Cron anstoßen
 curl -X POST http://localhost:8080/api/webhook/mywhoosh
 
-# JOIN-TCX direkt aus einem Skript senden (nach Mail-Export)
-curl -X POST http://localhost:8080/api/webhook/upload \
-  -F "file=@join_workout_....tcx"
+# JOIN-TCX direkt senden
+curl -X POST http://localhost:8080/api/webhook/upload -F "file=@join_workout.tcx"
 
-# Oder roher Body mit Dateinamen-Header
+# oder als rohen Body mit Dateinamen-Header
 curl -X POST http://localhost:8080/api/webhook/upload \
-  -H "X-Filename: join_workout.tcx" \
-  --data-binary @join_workout_....tcx
+  -H "X-Filename: join_workout.tcx" --data-binary @join_workout.tcx
 ```
-
-Die Jobs laufen asynchron: die Endpunkte antworten sofort mit `202`, der
-Fortschritt erscheint in `/api/status` (und der Web-App). Während ein Sync
-läuft, antworten weitere Jobs mit `409`. Es gibt bewusst keine Authentifizierung
-— halte den Port hinter NAT/firewall oder binde den Server nur an `127.0.0.1`
-(`HTTP_ADDR=127.0.0.1:8080`), wenn du Zugangsdaten drauflegst.
 
 ### Umgebungsvariablen
 
 | Variable | Default | Beschreibung |
 |---|---|---|
 | `HTTP_ADDR` | `:8080` | Listen-Adresse |
-| `DATA_DIR` | `./data` | Zustandsverzeichnis (im Container `/data`) |
+| `DATA_DIR` | `./data` (Container: `/data`) | Zustandsverzeichnis |
 | `GARMIN_EMAIL` / `GARMIN_PASSWORD` | — | Garmin-Konto (überschreibt Web-Konfig) |
 | `MYWHOOSH_EMAIL` / `MYWHOOSH_PASSWORD` | — | MyWhoosh-Konto |
-| `SYNC_DAYS` | `10` | MyWhoosh-Sichtfenster (Tage) |
+| `SYNC_DAYS` | `10` | Sichtfenster in Tagen |
+| `AUTH_USER` / `AUTH_PASSWORD` | `admin` / — | Basic-Auth; ohne Passwort kein Schutz |
 
 ### JOIN Cycling (TCX)
 
-Der JOIN Workout-Player verschickt das Training als TCX-Datei (per E-Mail) —
-Garmin unterstützt das direkte Hochladen nicht. Der Server übernimmt das:
-Er entfernt den JOIN-Author-Block und versieht die Activity mit einem Garmin
-Device-`<Creator>` (Fenix 6S Pro) — dieselbe Spoofing-Logik wie beim
-MyWhoosh-FIT -, sodass Garmin Connect die Einheit vollständig verarbeitet. Die
-Trackdaten (Power, HR, Cadence, Speed) bleiben byte-genau erhalten.
+Der JOIN Workout-Player exportiert TCX-Dateien, die Garmin Connect nicht direkt annimmt. Der Server entfernt den JOIN-Author-Block und trägt ein Garmin-Gerät (Fenix 6S Pro) als `<Creator>` ein. Die Trackdaten (Leistung, Puls, Kadenz, Geschwindigkeit) bleiben unverändert.
 
-## How It Works
+## Einschränkungen
 
+- **Kein MFA**: Ist bei deinem Garmin-Konto die Zwei-Faktor-Anmeldung aktiv, schlägt der Login fehl.
+- Der Garmin-Login nutzt inoffizielle Schnittstellen und kann sich ohne Vorwarnung ändern.
+
+## Entwicklung
+
+```bash
+# Tests (kein C-Compiler nötig)
+go test ./internal/... ./garmin/... ./mywhoosh/... ./cmd/...
+
+# Server (ohne CGO)
+CGO_ENABLED=0 go build -o mywhoosh2garmin-server ./cmd/server
+
+# Desktop-GUI (braucht GCC; unter Windows z. B. MSYS2/MinGW)
+go build -o mywhoosh2garmin.exe .
 ```
-  ┌─────────────────────┐
-  │  MyWhoosh Web API   │
-  │  Login + List       │
-  │  Download FIT file  │
-  └─────────┬───────────┘
-            │
-            ▼
-  ┌─────────────────────┐
-  │  Decode FIT (V2)    │
-  │  Fix session avgs   │
-  │  Strip temperature  │
-  │  Spoof → Fenix 6S   │
-  │  Encode FIT (V2)    │
-  └─────────┬───────────┘
-            │
-            ▼
-  ┌─────────────────────┐
-  │  Garmin SSO Login   │
-  │  OAuth1 → OAuth2    │
-  │  Upload FIT file    │
-  └─────────────────────┘
-            │
-            ▼
-     Garmin Connect
-  (Training Effect ✓)
-  (VO2max ✓)
-  (Training Load ✓)
+
+### Neue Version veröffentlichen
+
+```bash
+git tag v1.2.0 && git push origin v1.2.0
 ```
+
+Das löst zwei Workflows aus:
+
+- `release.yml` baut die Windows-App und hängt sie an das GitHub-Release.
+- `docker.yml` veröffentlicht das Image als `ghcr.io/hauz22/mywhoosh2garmin:1.2.0`, `:1.2`, `:1` und `:latest`.
+
+Jeder Push auf `main` aktualisiert zusätzlich das Vorabimage `:edge`.
 
 ## Credits
 
-- [garth](https://github.com/matin/garth) by matin — Garmin SSO authentication reference
-- [muktihari/fit](https://github.com/muktihari/fit) — FIT SDK for Go
-- [Fyne](https://fyne.io/) — cross-platform GUI toolkit
+- [garth](https://github.com/matin/garth) — Referenz für die Garmin-SSO-Anmeldung
+- [muktihari/fit](https://github.com/muktihari/fit) — FIT SDK für Go
+- [Fyne](https://fyne.io/) — GUI-Toolkit
 
-## License
+## Lizenz
 
-GPLv3 — see [LICENSE](LICENSE).
+GPLv3 — siehe [LICENSE](LICENSE).
