@@ -1,20 +1,35 @@
+# Fertiges Image aus der GitHub Container Registry — nichts muss lokal gebaut werden.
+#
+#   docker compose up -d                          # starten
+#   docker compose pull && docker compose up -d   # auf neue Version aktualisieren
+#
+# Welche Version läuft, steuert IMAGE_TAG (siehe .env.example):
+#   latest  = zuletzt veröffentlichte Version (Standard)
+#   1.2.3   = genau diese Version (empfohlen für reproduzierbare Setups)
+#   edge    = aktueller Stand des main-Branches (Vorabversion)
 services:
-  fittogarmin:
-    build: .
-    image: fittogarmin:latest
-    container_name: fittogarmin
+  mywhoosh2garmin:
+    image: ghcr.io/hauz22/mywhoosh2garmin:${IMAGE_TAG:-latest}
+    container_name: mywhoosh2garmin
     environment:
       GARMIN_EMAIL: ${GARMIN_EMAIL:-}
       GARMIN_PASSWORD: ${GARMIN_PASSWORD:-}
       MYWHOOSH_EMAIL: ${MYWHOOSH_EMAIL:-}
       MYWHOOSH_PASSWORD: ${MYWHOOSH_PASSWORD:-}
       SYNC_DAYS: ${SYNC_DAYS:-10}
-      HTTP_ADDR: ":8080"
+      # Optionaler Passwortschutz der Web-App (HTTP Basic Auth). Leer = kein Schutz.
+      AUTH_USER: ${AUTH_USER:-admin}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-}
+      TZ: ${TZ:-Europe/Berlin}
     ports:
-      - "8080:8080"
+      # Nur lokal erreichbar: "127.0.0.1:8080:8080" — im LAN: "8080:8080"
+      - "${HTTP_PORT:-8080}:8080"
     volumes:
+      # Tokens, Konfiguration und synced.json (Liste der bereits hochgeladenen Fahrten)
       - fittogarmin-data:/data
     restart: unless-stopped
 
 volumes:
+  # Name bewusst aus der Vorversion übernommen, damit bestehende Installationen
+  # ihre Tokens und die Sync-Historie behalten.
   fittogarmin-data:

@@ -1,10 +1,13 @@
 .git
+.github
 .gitignore
+.gitattributes
+.env
 data
+dist
+bin
 *.exe
 *.fit
 *.tcx
-join_workout_player_GNRJPZNZXJHQVCVJVXJH.tcx
-images
 README.md
-dist
+docker-compose*.yml

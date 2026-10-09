@@ -1,6 +1,9 @@
+// Package mywhoosh is a minimal client for the MyWhoosh web API: login,
+// activity list and FIT download.
 package mywhoosh
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,20 +16,14 @@ import (
 	"github.com/google/uuid"
 )
 
-const (
+// API endpoints. Variables (not constants) so tests can point them at httptest.
+var (
 	loginURL       = "https://services.mywhoosh.com/http-service/api/login"
 	activitiesBase = "https://service14.mywhoosh.com/v2/"
 )
 
-// DebugFn can be set to redirect debug output (e.g., to a GUI log).
-var debugFn = func(format string, args ...interface{}) {
-	fmt.Printf(format+"\n", args...)
-}
-
-// SetDebugFn sets the debug log function.
-func SetDebugFn(fn func(string, ...interface{})) {
-	debugFn = fn
-}
+// maxFitSize caps a downloaded FIT file (a multi-hour ride is well below 5 MB).
+const maxFitSize = 64 << 20
 
 // Activity represents a single MyWhoosh ride activity.
 type Activity struct {
@@ -53,8 +50,7 @@ func (a *Activity) FormattedDate() string {
 			return t.Local().Format("Mon 02 Jan 2006 15:04")
 		}
 	}
-	t := time.Unix(int64(a.Date), 0)
-	return t.Format("Mon 02 Jan 2006 15:04")
+	return time.Unix(a.DateUnix(), 0).Format("Mon 02 Jan 2006 15:04")
 }
 
 // FormattedDuration returns the ride duration as a human-readable string.
@@ -89,11 +85,10 @@ func (a *Activity) FormattedDistance() string {
 
 // DisplayName returns a useful display name for the activity.
 func (a *Activity) DisplayName() string {
-	name := a.Name
-	if name == "" {
-		name = "Activity"
+	if a.Name == "" {
+		return "Activity"
 	}
-	return name
+	return a.Name
 }
 
 // DateUnix returns the activity date as a Unix timestamp.
@@ -151,10 +146,18 @@ func (c *Client) saveToken() {
 	if c.tokenDir == "" {
 		return
 	}
-	os.MkdirAll(c.tokenDir, 0o700)
+	_ = os.MkdirAll(c.tokenDir, 0o700)
 	ct := cachedToken{AccessToken: c.token, WhooshID: c.whooshID}
 	data, _ := json.MarshalIndent(ct, "", "  ")
-	os.WriteFile(filepath.Join(c.tokenDir, "mywhoosh_token.json"), data, 0o600)
+	_ = os.WriteFile(filepath.Join(c.tokenDir, "mywhoosh_token.json"), data, 0o600)
+}
+
+// ClearToken forgets the cached session (in memory and on disk).
+func (c *Client) ClearToken() {
+	c.token, c.whooshID = "", ""
+	if c.tokenDir != "" {
+		_ = os.Remove(filepath.Join(c.tokenDir, "mywhoosh_token.json"))
+	}
 }
 
 // Login authenticates with MyWhoosh using email and password.
@@ -174,7 +177,7 @@ func (c *Client) Login(email, password string) error {
 		return fmt.Errorf("marshal login payload: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", loginURL, strings.NewReader(string(jsonBody)))
+	req, err := http.NewRequest("POST", loginURL, bytes.NewReader(jsonBody))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -192,16 +195,14 @@ func (c *Client) Login(email, password string) error {
 	}
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("login failed (HTTP %d): %s", resp.StatusCode,
-			string(body[:min(300, len(body))]))
+		return fmt.Errorf("login failed (HTTP %d): %s", resp.StatusCode, snippet(body))
 	}
 
 	var result struct {
-		Success      bool   `json:"Success"`
-		Message      string `json:"Message"`
-		AccessToken  string `json:"AccessToken"`
-		RefreshToken string `json:"RefreshToken"`
-		WhooshId     string `json:"WhooshId"`
+		Success     bool   `json:"Success"`
+		Message     string `json:"Message"`
+		AccessToken string `json:"AccessToken"`
+		WhooshId    string `json:"WhooshId"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("parse login response: %w", err)
@@ -225,105 +226,16 @@ func (c *Client) Login(email, password string) error {
 	return nil
 }
 
-// IsAuthenticated returns true if the client has a valid token.
-func (c *Client) IsAuthenticated() bool {
-	return c.token != ""
-}
-
-// GetActivities fetches all activities, paginated. Returns newest first.
-func (c *Client) GetActivities() ([]Activity, error) {
+// post sends an authenticated JSON POST to the activities API.
+func (c *Client) post(path string, payload interface{}) ([]byte, error) {
 	if c.token == "" {
 		return nil, fmt.Errorf("not authenticated — login first")
 	}
-
-	activitiesURL := activitiesBase + "rider/profile/activities"
-	var allActivities []Activity
-	page := 1
-
-	for {
-		payload := fmt.Sprintf(`{"sortDate":"DESC","page":%d}`, page)
-
-		req, err := http.NewRequest("POST", activitiesURL, strings.NewReader(payload))
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+c.token)
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("activities request: %w", err)
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if err != nil {
-			return nil, fmt.Errorf("read response: %w", err)
-		}
-
-		if resp.StatusCode >= 400 {
-			return nil, fmt.Errorf("fetch activities failed (HTTP %d): %s",
-				resp.StatusCode, string(body[:min(300, len(body))]))
-		}
-
-		var result struct {
-			Data struct {
-				Results    []json.RawMessage `json:"results"`
-				TotalPages int               `json:"totalPages"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(body, &result); err != nil {
-			return nil, fmt.Errorf("parse activities: %w", err)
-		}
-
-		for _, rawAct := range result.Data.Results {
-			var act Activity
-			if err := json.Unmarshal(rawAct, &act); err == nil {
-				allActivities = append(allActivities, act)
-			}
-		}
-
-		if page >= result.Data.TotalPages {
-			break
-		}
-		page++
-	}
-
-	return allActivities, nil
-}
-
-// GetRecentActivities returns activities from the last N days.
-func (c *Client) GetRecentActivities(days int) ([]Activity, error) {
-	all, err := c.GetActivities()
+	jsonBody, err := json.Marshal(payload)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("marshal payload: %w", err)
 	}
-
-	cutoff := time.Now().AddDate(0, 0, -days).Unix()
-	var recent []Activity
-	for _, a := range all {
-		if a.DateUnix() >= cutoff {
-			recent = append(recent, a)
-		} else {
-			// Activities are sorted DESC, so once we pass the cutoff we can stop
-			break
-		}
-	}
-
-	return recent, nil
-}
-
-// DownloadFitFile downloads the FIT file for a given activity and returns the raw bytes.
-func (c *Client) DownloadFitFile(activityFileID string) ([]byte, error) {
-	if c.token == "" {
-		return nil, fmt.Errorf("not authenticated — login first")
-	}
-
-	downloadURL := activitiesBase + "rider/profile/download-activity-file"
-	payload := fmt.Sprintf(`{"fileId":"%s"}`, activityFileID)
-
-	req, err := http.NewRequest("POST", downloadURL, strings.NewReader(payload))
+	req, err := http.NewRequest("POST", activitiesBase+path, bytes.NewReader(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -332,7 +244,7 @@ func (c *Client) DownloadFitFile(activityFileID string) ([]byte, error) {
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("download request: %w", err)
+		return nil, fmt.Errorf("request %s: %w", path, err)
 	}
 	defer resp.Body.Close()
 
@@ -340,10 +252,76 @@ func (c *Client) DownloadFitFile(activityFileID string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
-
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("download failed (HTTP %d): %s",
-			resp.StatusCode, string(body[:min(300, len(body))]))
+		return nil, fmt.Errorf("%s failed (HTTP %d): %s", path, resp.StatusCode, snippet(body))
+	}
+	return body, nil
+}
+
+// activitiesPage is one page of the (newest-first) activity list.
+type activitiesPage struct {
+	Activities []Activity
+	TotalPages int
+}
+
+func (c *Client) fetchPage(page int) (activitiesPage, error) {
+	body, err := c.post("rider/profile/activities", map[string]interface{}{
+		"sortDate": "DESC",
+		"page":     page,
+	})
+	if err != nil {
+		return activitiesPage{}, err
+	}
+
+	var result struct {
+		Data struct {
+			Results    []json.RawMessage `json:"results"`
+			TotalPages int               `json:"totalPages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return activitiesPage{}, fmt.Errorf("parse activities: %w", err)
+	}
+
+	out := activitiesPage{TotalPages: result.Data.TotalPages}
+	for _, raw := range result.Data.Results {
+		var act Activity
+		if err := json.Unmarshal(raw, &act); err == nil {
+			out.Activities = append(out.Activities, act)
+		}
+	}
+	return out, nil
+}
+
+// GetRecentActivities returns activities from the last N days (newest first).
+// The API lists newest first, so paging stops as soon as a page reaches past
+// the cutoff instead of downloading the complete ride history.
+func (c *Client) GetRecentActivities(days int) ([]Activity, error) {
+	cutoff := time.Now().AddDate(0, 0, -days).Unix()
+	var recent []Activity
+
+	for page := 1; ; page++ {
+		p, err := c.fetchPage(page)
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range p.Activities {
+			if a.DateUnix() < cutoff {
+				return recent, nil
+			}
+			recent = append(recent, a)
+		}
+		if len(p.Activities) == 0 || page >= p.TotalPages {
+			return recent, nil
+		}
+	}
+}
+
+// DownloadFitFile downloads the FIT file for a given activity and returns the raw bytes.
+func (c *Client) DownloadFitFile(activityFileID string) ([]byte, error) {
+	body, err := c.post("rider/profile/download-activity-file", map[string]string{"fileId": activityFileID})
+	if err != nil {
+		return nil, err
 	}
 
 	// Response contains a pre-signed S3 URL
@@ -353,7 +331,6 @@ func (c *Client) DownloadFitFile(activityFileID string) ([]byte, error) {
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("parse download response: %w", err)
 	}
-
 	if result.Data == "" {
 		return nil, fmt.Errorf("no download URL in response")
 	}
@@ -365,14 +342,16 @@ func (c *Client) DownloadFitFile(activityFileID string) ([]byte, error) {
 	}
 	defer fitResp.Body.Close()
 
-	fitData, err := io.ReadAll(fitResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read FIT file: %w", err)
-	}
-
 	if fitResp.StatusCode >= 400 {
 		return nil, fmt.Errorf("FIT download failed (HTTP %d)", fitResp.StatusCode)
 	}
-
+	fitData, err := io.ReadAll(io.LimitReader(fitResp.Body, maxFitSize))
+	if err != nil {
+		return nil, fmt.Errorf("read FIT file: %w", err)
+	}
 	return fitData, nil
+}
+
+func snippet(body []byte) string {
+	return string(body[:min(300, len(body))])
 }

@@ -1,6 +1,7 @@
 package fitfix
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -84,7 +85,7 @@ func TestFixFit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fixed, err := FixFit(raw)
+	fixed, err := FixFit(raw, nil)
 	if err != nil {
 		t.Fatalf("FixFit failed: %v", err)
 	}
@@ -147,48 +148,41 @@ func TestFixFit(t *testing.T) {
 	}
 }
 
-func TestFindMostRecentFitFile(t *testing.T) {
+func TestFixFitSpoofsDevice(t *testing.T) {
 	tmpDir := t.TempDir()
-
-	// Create fake FIT files with different version numbers
-	files := []string{
-		"MyNewActivity-3.7.0.fit",
-		"MyNewActivity-3.8.5.fit",
-		"MyNewActivity-3.8.1.fit",
-	}
-	for _, name := range files {
-		if err := os.WriteFile(filepath.Join(tmpDir, name), []byte("fake"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	got, err := FindMostRecentFitFile(tmpDir)
+	path := filepath.Join(tmpDir, "in.fit")
+	createTestFitFile(t, path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	want := filepath.Join(tmpDir, "MyNewActivity-3.8.5.fit")
-	if got != want {
-		t.Errorf("got %s, want %s", got, want)
+	var logged int
+	fixed, err := FixFit(raw, func(string, ...interface{}) { logged++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if logged == 0 {
+		t.Error("expected log output")
+	}
+
+	lis := filedef.NewListener()
+	defer lis.Close()
+	dec := decoder.New(bytes.NewReader(fixed), decoder.WithMesgListener(lis), decoder.WithBroadcastOnly())
+	if _, err := dec.Decode(); err != nil {
+		t.Fatal(err)
+	}
+	act := lis.File().(*filedef.Activity)
+	if act.FileId.Manufacturer != typedef.ManufacturerGarmin {
+		t.Errorf("manufacturer = %v, want Garmin", act.FileId.Manufacturer)
+	}
+	if act.FileId.Product != typedef.GarminProductFenix6s.Uint16() {
+		t.Errorf("product = %d, want fenix 6s", act.FileId.Product)
 	}
 }
 
-func TestGenerateOutputFilename(t *testing.T) {
-	name := GenerateOutputFilename("/some/path/MyNewActivity-3.8.5.fit")
-	if !contains(name, "MyNewActivity-3.8.5_") || !contains(name, ".fit") {
-		t.Errorf("unexpected filename: %s", name)
+func TestFixFitRejectsGarbage(t *testing.T) {
+	if _, err := FixFit([]byte("this is not a FIT file"), nil); err == nil {
+		t.Fatal("expected decode error")
 	}
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && searchSubstr(s, substr)
-}
-
-func searchSubstr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }

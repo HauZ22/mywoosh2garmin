@@ -48,11 +48,6 @@ func TestFixTcx(t *testing.T) {
 	if diff := len(fixed) - len(raw); diff > 100 || diff < -100 {
 		t.Errorf("unexpected size delta: %d", diff)
 	}
-
-	// 6. ContentHash is stable
-	if h1, h2 := ContentHash(raw), ContentHash(raw); h1 != h2 || len(h1) != 64 {
-		t.Errorf("ContentHash not stable/hex: %q", h1)
-	}
 }
 
 func TestFixTcxNoAuthorStillWorks(t *testing.T) {

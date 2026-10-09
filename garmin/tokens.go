@@ -36,11 +36,6 @@ func (t *OAuth2Token) Expired() bool {
 	return t.ExpiresAt < time.Now().Unix()
 }
 
-// RefreshExpired returns true if the refresh token has expired.
-func (t *OAuth2Token) RefreshExpired() bool {
-	return t.RefreshTokenExpiresAt < time.Now().Unix()
-}
-
 // Bearer returns the Authorization header value.
 func (t *OAuth2Token) Bearer() string {
 	return fmt.Sprintf("Bearer %s", t.AccessToken)
@@ -70,6 +65,12 @@ func SaveTokens(dir string, oauth1 *OAuth1Token, oauth2 *OAuth2Token) error {
 		}
 	}
 	return nil
+}
+
+// ClearTokens deletes the cached tokens (e.g. after the account was changed).
+func ClearTokens(dir string) {
+	_ = os.Remove(filepath.Join(dir, "oauth1_token.json"))
+	_ = os.Remove(filepath.Join(dir, "oauth2_token.json"))
 }
 
 // LoadTokens loads OAuth1 and OAuth2 tokens from the given directory.

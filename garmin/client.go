@@ -1,8 +1,11 @@
+// Package garmin implements the Garmin Connect SSO login (OAuth1 → OAuth2)
+// and the activity-file upload.
 package garmin
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -14,12 +17,18 @@ import (
 
 const apiUserAgent = "GCM-iOS-5.19.1.2"
 
+// ErrDuplicate is returned by Upload when Garmin Connect already has the activity.
+var ErrDuplicate = errors.New("duplicate activity (already uploaded to Garmin)")
+
 // Client manages authentication and uploads to Garmin Connect.
 type Client struct {
 	OAuth1   *OAuth1Token
 	OAuth2   *OAuth2Token
 	Domain   string
 	TokenDir string // directory where tokens are cached
+
+	// Logf receives progress messages; nil silences them.
+	Logf func(format string, args ...interface{})
 }
 
 // NewClient creates a Client that caches tokens in tokenDir.
@@ -27,6 +36,12 @@ func NewClient(tokenDir string) *Client {
 	return &Client{
 		Domain:   "garmin.com",
 		TokenDir: tokenDir,
+	}
+}
+
+func (c *Client) logf(format string, args ...interface{}) {
+	if c.Logf != nil {
+		c.Logf(format, args...)
 	}
 }
 
@@ -54,7 +69,7 @@ func (c *Client) Resume() error {
 	}
 
 	// OAuth2 expired — try to refresh using OAuth1 (lasts ~1 year)
-	fmt.Println("  session expired, refreshing...")
+	c.logf("Garmin-Session abgelaufen, wird erneuert…")
 	if err := c.refreshOAuth2(); err != nil {
 		return fmt.Errorf("refresh failed: %w", err)
 	}
@@ -74,27 +89,16 @@ func (c *Client) Login(email, password string) error {
 	// Cache tokens for next time
 	if c.TokenDir != "" {
 		if err := SaveTokens(c.TokenDir, oauth1, oauth2); err != nil {
-			fmt.Printf("  warning: could not cache tokens: %v\n", err)
+			c.logf("Warnung: Tokens konnten nicht gespeichert werden: %v", err)
 		}
 	}
 	return nil
 }
 
-// UploadFIT uploads a FIT file to Garmin Connect.
-// Automatically refreshes the OAuth2 token if expired.
-func (c *Client) UploadFIT(filePath string) error {
-	return c.upload(filePath)
-}
-
-// UploadFile uploads a FIT or TCX activity file to Garmin Connect.
-// This is a thin alias over the same upload pipeline.
-func (c *Client) UploadFile(filePath string) error {
-	return c.upload(filePath)
-}
-
-// upload is the shared upload pipeline (FIT and TCX are both accepted by the
-// Garmin Connect upload-service, selected by file extension).
-func (c *Client) upload(filePath string) error {
+// Upload sends a FIT or TCX activity file to Garmin Connect (the format is
+// selected by the file extension). It refreshes the OAuth2 token if needed and
+// returns ErrDuplicate if Garmin already knows the activity.
+func (c *Client) Upload(filePath string) error {
 	if c.OAuth2 == nil {
 		return fmt.Errorf("not authenticated")
 	}
@@ -113,8 +117,8 @@ func (c *Client) upload(filePath string) error {
 	}
 
 	// Retry once on 401 (token might be stale despite not being expired)
-	if status == 401 {
-		fmt.Println("  token rejected, refreshing...")
+	if status == http.StatusUnauthorized {
+		c.logf("Garmin-Token abgelehnt, wird erneuert…")
 		if err := c.refreshOAuth2(); err != nil {
 			return fmt.Errorf("token refresh: %w", err)
 		}
@@ -160,7 +164,9 @@ func (c *Client) doUpload(filePath string) (int, []byte, error) {
 	if _, err := io.Copy(part, f); err != nil {
 		return 0, nil, err
 	}
-	writer.Close()
+	if err := writer.Close(); err != nil {
+		return 0, nil, err
+	}
 
 	uploadURL := fmt.Sprintf("https://connectapi.%s/upload-service/upload", c.Domain)
 	req, err := http.NewRequest("POST", uploadURL, &buf)
@@ -190,8 +196,8 @@ func (c *Client) doUpload(filePath string) (int, []byte, error) {
 
 // parseUploadResult checks the upload response for errors.
 func parseUploadResult(status int, body []byte) error {
-	if status == 409 {
-		return fmt.Errorf("duplicate activity (already uploaded to Garmin)")
+	if status == http.StatusConflict {
+		return ErrDuplicate
 	}
 	if status >= 400 {
 		return fmt.Errorf("upload failed (HTTP %d): %s", status,
@@ -201,7 +207,7 @@ func parseUploadResult(status int, body []byte) error {
 	// Check for failures in the detailed result
 	var result struct {
 		DetailedImportResult struct {
-			Failures []interface{} `json:"failures"`
+			Failures  []interface{} `json:"failures"`
 			Successes []interface{} `json:"successes"`
 		} `json:"detailedImportResult"`
 	}

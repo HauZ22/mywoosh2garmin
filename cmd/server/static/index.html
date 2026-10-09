@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FIT → Garmin Sync</title>
+<title>MyWhoosh → Garmin Sync</title>
 <style>
   :root { --bg:#0f1720; --panel:#182432; --line:#2b3b4d; --text:#e6edf3; --muted:#8fa3b8; --accent:#3b82f6; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; }
   * { box-sizing: border-box; }
@@ -22,6 +22,11 @@
   .status { margin-top:10px; font-size:13px; }
   .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; margin-right:6px; }
   .ok { background:#0a2e1a; color:var(--ok); } .warn { background:#2e240a; color:var(--warn); } .err { background:#2e0a0a; color:var(--err); }
+  .info { background:#0c2340; color:#60a5fa; }
+  button.sm { padding:4px 10px; font-size:12px; margin-right:6px; }
+  td.actions { white-space:nowrap; }
+  .toolbar { display:flex; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
+  .version { font-size:12px; color:var(--muted); }
   #log { background:#0b121a; border:1px solid var(--line); border-radius:6px; padding:10px; font-family:ui-monospace, Consolas, monospace; font-size:12px; height:280px; overflow:auto; white-space:pre-wrap; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
@@ -32,7 +37,7 @@
 </head>
 <body>
 <header>
-  <h1>FIT → Garmin Sync</h1>
+  <h1>MyWhoosh → Garmin Sync <span id="version" class="version"></span></h1>
   <span id="busyBadge" class="badge ok" hidden>läuft</span>
   <button id="refreshBtn" class="ghost">Status</button>
 </header>
@@ -62,10 +67,12 @@
 
   <section>
     <h2>MyWhoosh Aktivitäten & Sync</h2>
-    <p class="muted">Laden Sie Ihre Aktivitäten, laden Sie einzelne Fahrten hoch oder starten Sie einen automatischen Komplett-Sync aller neuen Aktivitäten.</p>
-    <div style="display:flex; gap:12px; margin-bottom:16px;">
+    <p class="muted">Lade deine Aktivitäten, lade einzelne Fahrten hoch oder synchronisiere alle neuen auf einmal.
+      War eine Fahrt schon (z.&nbsp;B. von Hand) auf Garmin? Mit <b>„Schon auf Garmin“</b> wird sie dauerhaft als hochgeladen gemerkt und nie mehr hochgeladen — das lässt sich jederzeit wieder rückgängig machen.</p>
+    <div class="toolbar">
       <button id="fetchActivitiesBtn" class="ghost">Aktivitäten laden</button>
       <button id="syncBtn">Alle neuen synchronisieren</button>
+      <button id="markAllBtn" class="ghost" hidden>Alle offenen als hochgeladen markieren</button>
     </div>
     <div id="syncResult" class="status"></div>
     <div id="activitiesList" style="margin-top:16px;"></div>
@@ -117,6 +124,7 @@ async function refresh() {
   $('syncBtn').disabled = s.busy;
   $('saveCfg').disabled = s.busy;
   $('fetchActivitiesBtn').disabled = s.busy;
+  $('version').textContent = s.version && s.version !== 'dev' ? s.version : '';
 
   if (!configLoaded) {
     if (!document.activeElement || document.activeElement.id !== 'mwEmail') $('mwEmail').value = s.config.mywhoosh_email || '';
@@ -185,48 +193,107 @@ $('syncBtn').onclick = async () => {
 };
 
 // Activity List Logic
+let currentActivities = [];
 $('fetchActivitiesBtn').onclick = fetchActivities;
 
 async function fetchActivities() {
-    $('activitiesList').innerHTML = 'Lade Aktivitäten...';
-    try {
-        const activities = await api('/api/activities?days=' + ($('days').value || 10));
-        renderActivities(activities);
-    } catch (e) {
-        $('activitiesList').innerHTML = '<span class="err">Fehler: ' + escapeHtml(e.message) + '</span>';
-    }
+  $('activitiesList').textContent = 'Lade Aktivitäten…';
+  try {
+    currentActivities = await api('/api/activities?days=' + ($('days').value || 10));
+    renderActivities();
+  } catch (e) {
+    $('activitiesList').innerHTML = '<span class="err">Fehler: ' + escapeHtml(e.message) + '</span>';
+  }
 }
 
-function renderActivities(activities) {
-    if (activities.length === 0) {
-        $('activitiesList').innerHTML = 'Keine Aktivitäten gefunden.';
-        return;
-    }
-    let html = '<table><tr><th>Name</th><th>Datum</th><th>Status</th><th>Aktion</th></tr>';
-    activities.forEach(act => {
-        const date = new Date(act.date * 1000).toLocaleString();
-        html += `<tr>
-            <td>${escapeHtml(act.title || 'Aktivität')}</td>
-            <td>${date}</td>
-            <td>${act.is_synced ? '<span class="badge ok">Synchronisiert</span>' : '<span class="badge warn">Neu</span>'}</td>
-            <td>${!act.is_synced ? `<button onclick="syncSingleActivity('${act.id}')" class="ghost">Upload</button>` : ''}</td>
-        </tr>`;
-    });
-    html += '</table>';
-    $('activitiesList').innerHTML = html;
+function syncBadge(act) {
+  if (!act.is_synced) return '<span class="badge warn">Neu</span>';
+  switch (act.sync_source) {
+    case 'manual': return '<span class="badge info" title="Von dir als hochgeladen markiert">Manuell markiert</span>';
+    case 'duplicate': return '<span class="badge ok" title="Garmin kannte die Aktivität bereits">Auf Garmin vorhanden</span>';
+    case 'auto-skip': return '<span class="badge" title="Älter als die Aktivierung des Auto-Syncs">Übersprungen (alt)</span>';
+    default: return '<span class="badge ok">Hochgeladen</span>';
+  }
 }
 
-async function syncSingleActivity(id) {
-    try {
-        await api('/api/sync/activity', { 
-            method: 'POST', 
-            headers: {'Content-Type':'application/json'}, 
-            body: JSON.stringify({id: id}) 
-        });
-        fetchActivities();
-    } catch (e) {
-        alert('Upload fehlgeschlagen: ' + e.message);
+function activityDetails(act) {
+  const parts = [];
+  if (act.distance) parts.push(act.distance.toFixed(1) + ' km');
+  if (act.rideDuration) parts.push(act.rideDuration.split('.')[0]);
+  if (act.watt) parts.push(Math.round(act.watt) + ' W');
+  if (act.heartrate) parts.push(Math.round(act.heartrate) + ' bpm');
+  return parts.join(' · ');
+}
+
+function renderActivities() {
+  const acts = currentActivities;
+  $('markAllBtn').hidden = !acts.some(a => !a.is_synced);
+  if (acts.length === 0) {
+    $('activitiesList').textContent = 'Keine Aktivitäten gefunden.';
+    return;
+  }
+  const rows = acts.map(act => {
+    const actions = act.is_synced
+      ? '<button class="ghost sm" data-act="unmark" title="Markierung entfernen, Aktivität wird wieder als neu behandelt">Markierung entfernen</button>'
+      : '<button class="ghost sm" data-act="upload">Upload</button>' +
+        '<button class="ghost sm" data-act="mark" title="Ist schon auf Garmin — dauerhaft als hochgeladen merken">Schon auf Garmin</button>';
+    return '<tr data-id="' + escapeHtml(act.id) + '">' +
+      '<td>' + escapeHtml(new Date(act.date * 1000).toLocaleString()) + '</td>' +
+      '<td>' + escapeHtml(act.title || 'Aktivität') + '<div class="muted">' + escapeHtml(activityDetails(act)) + '</div></td>' +
+      '<td>' + syncBadge(act) + '</td>' +
+      '<td class="actions">' + actions + '</td></tr>';
+  });
+  $('activitiesList').innerHTML =
+    '<table><tr><th>Datum</th><th>Aktivität</th><th>Status</th><th>Aktion</th></tr>' + rows.join('') + '</table>';
+}
+
+$('activitiesList').addEventListener('click', async e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const id = btn.closest('tr').dataset.id;
+  const action = btn.dataset.act;
+  btn.disabled = true;
+  try {
+    if (action === 'upload') {
+      await api('/api/sync/activity', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id }) });
+      await waitUntilIdle();
+      await fetchActivities();
+    } else {
+      await setSynced([id], action === 'mark');
     }
+  } catch (err) {
+    btn.disabled = false;
+    alert((action === 'upload' ? 'Upload fehlgeschlagen: ' : 'Markieren fehlgeschlagen: ') + err.message);
+  }
+});
+
+$('markAllBtn').onclick = async () => {
+  const ids = currentActivities.filter(a => !a.is_synced).map(a => a.id);
+  if (!ids.length) return;
+  if (!confirm(ids.length + ' offene Aktivität(en) als „schon auf Garmin“ markieren?\nSie werden dann nicht mehr hochgeladen (rückgängig machbar).')) return;
+  try { await setSynced(ids, true); } catch (err) { alert('Markieren fehlgeschlagen: ' + err.message); }
+};
+
+// Persist the marker on the server, then update the list locally (no MyWhoosh round-trip).
+async function setSynced(ids, synced) {
+  await api('/api/activities/mark', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ ids, synced }) });
+  currentActivities.forEach(a => {
+    if (ids.includes(a.id)) {
+      a.is_synced = synced;
+      a.sync_source = synced ? 'manual' : undefined;
+    }
+  });
+  renderActivities();
+  refresh().catch(() => {});
+}
+
+// Wait for the background job started by an upload to finish (max. 3 min).
+async function waitUntilIdle() {
+  for (let i = 0; i < 90; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    const s = await api('/api/status');
+    if (!s.busy) return;
+  }
 }
 
 const drop = $('drop');

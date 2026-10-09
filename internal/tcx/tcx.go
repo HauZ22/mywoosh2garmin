@@ -6,21 +6,12 @@ package tcx
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 
 	"mywhoosh2garmin/internal/device"
 )
 
 const closingActivity = "</Activity>"
-
-// ContentHash returns a stable SHA-256 hex digest of the raw file bytes.
-// It is used as the dedup key for TCX (and generic file) uploads.
-func ContentHash(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
 
 // FixTcx patches a JOIN Cycling TCX file:
 //
