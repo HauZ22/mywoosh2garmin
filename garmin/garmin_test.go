@@ -2,6 +2,10 @@ package garmin
 
 import (
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -15,7 +19,8 @@ func TestParseUploadResult(t *testing.T) {
 		wantDup bool
 	}{
 		{"ok", 201, `{"detailedImportResult":{"successes":[{"internalId":1}],"failures":[]}}`, false, false},
-		{"ok-empty-body", 202, ``, false, false},
+		{"accepted-is-not-complete", 202, ``, true, false},
+		{"created-empty-body-is-unconfirmed", 201, ``, true, false},
 		{"duplicate", 409, `{"detailedImportResult":{"failures":[{"messages":[{"code":202}]}]}}`, true, true},
 		{"failure-in-body", 201, `{"detailedImportResult":{"failures":[{"messages":[{"code":500}]}]}}`, true, false},
 		{"server-error", 500, `boom`, true, false},
@@ -31,6 +36,65 @@ func TestParseUploadResult(t *testing.T) {
 				t.Errorf("errors.Is(ErrDuplicate) = %v, want %v", got, tt.wantDup)
 			}
 		})
+	}
+}
+
+func TestUploadWaitsForGarminProcessing(t *testing.T) {
+	polls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/upload-service/upload/fit":
+			w.Header().Set("Location", "/upload-service/upload/status/123")
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodGet && r.URL.Path == "/upload-service/upload/status/123":
+			polls++
+			if polls == 1 {
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			w.Header().Set("Location", "/activity-service/activity/456")
+			w.WriteHeader(http.StatusCreated)
+		default:
+			http.Error(w, fmt.Sprintf("unexpected request: %s %s", r.Method, r.URL.Path), http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	client := NewClient(t.TempDir())
+	client.OAuth2 = &OAuth2Token{AccessToken: "test", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	client.apiBaseURL = srv.URL
+	client.httpClient = srv.Client()
+	client.pollInterval = time.Millisecond
+
+	file := t.TempDir() + "/activity.fit"
+	if err := os.WriteFile(file, []byte("fit data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Upload(file); err != nil {
+		t.Fatalf("Upload() error = %v", err)
+	}
+	if polls != 2 {
+		t.Fatalf("poll count = %d, want 2", polls)
+	}
+}
+
+func TestUploadRejectsAcceptedWithoutPollLocation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	client := NewClient(t.TempDir())
+	client.OAuth2 = &OAuth2Token{AccessToken: "test", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	client.apiBaseURL = srv.URL
+	client.httpClient = srv.Client()
+
+	file := t.TempDir() + "/activity.fit"
+	if err := os.WriteFile(file, []byte("fit data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Upload(file); err == nil {
+		t.Fatal("Upload() succeeded for an unconfirmed HTTP 202 response")
 	}
 }
 
