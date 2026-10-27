@@ -3,6 +3,7 @@ package garmin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -102,8 +103,17 @@ func (s *ssoSession) post(reqURL string, form url.Values, useReferer bool) (stri
 	return string(body), nil
 }
 
+// MFAPrompt asks the user for the two-factor code Garmin just sent (e-mail or
+// authenticator app). It is called at most once per login and may block.
+type MFAPrompt func() (string, error)
+
+// ErrMFARequired is returned by Login when the account uses two-factor
+// authentication but no MFAPrompt was supplied.
+var ErrMFARequired = errors.New("Garmin verlangt einen 2FA-Code, aber hier ist keine Eingabe möglich")
+
 // Login performs the full Garmin SSO login flow and returns OAuth tokens.
-func Login(email, password, domain string) (*OAuth1Token, *OAuth2Token, error) {
+// promptMFA is only called if the account has two-factor authentication.
+func Login(email, password, domain string, promptMFA MFAPrompt) (*OAuth1Token, *OAuth2Token, error) {
 	if domain == "" {
 		domain = "garmin.com"
 	}
@@ -114,10 +124,31 @@ func Login(email, password, domain string) (*OAuth1Token, *OAuth2Token, error) {
 		return nil, nil, fmt.Errorf("fetch consumer: %w", err)
 	}
 
-	// 2. Start SSO session with cookie jar
-	sess := newSSOSession()
+	// 2.–7. SSO sign-in (incl. optional 2FA) → service ticket
+	ticket, err := signIn(newSSOSession(), "https://sso."+domain, email, password, promptMFA)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	ssoBase := fmt.Sprintf("https://sso.%s", domain)
+	// 8. Get OAuth1 token via OAuth1-signed request
+	oauth1Token, err := getOAuth1Token(consumer, ticket, domain)
+	if err != nil {
+		return nil, nil, fmt.Errorf("oauth1 token: %w", err)
+	}
+
+	// 9. Exchange OAuth1 for OAuth2 Bearer token
+	oauth2Token, err := exchangeOAuth2(consumer, oauth1Token, domain)
+	if err != nil {
+		return nil, nil, fmt.Errorf("oauth2 exchange: %w", err)
+	}
+
+	return oauth1Token, oauth2Token, nil
+}
+
+// signIn runs the SSO form login against ssoBase (https://sso.<domain>) and
+// returns the service ticket. If Garmin asks for a two-factor code, it is
+// obtained from promptMFA and submitted in the same session.
+func signIn(sess *ssoSession, ssoBase, email, password string, promptMFA MFAPrompt) (string, error) {
 	ssoEmbed := ssoBase + "/sso/embed"
 
 	embedParams := url.Values{
@@ -136,21 +167,20 @@ func Login(email, password, domain string) (*OAuth1Token, *OAuth2Token, error) {
 	}
 
 	// 3. GET /sso/embed — set cookies
-	_, err = sess.get(ssoEmbed+"?"+embedParams.Encode(), false)
-	if err != nil {
-		return nil, nil, fmt.Errorf("sso embed: %w", err)
+	if _, err := sess.get(ssoEmbed+"?"+embedParams.Encode(), false); err != nil {
+		return "", fmt.Errorf("sso embed: %w", err)
 	}
 
 	// 4. GET /sso/signin — extract CSRF token
 	signinURL := ssoBase + "/sso/signin?" + signinParams.Encode()
 	body, err := sess.get(signinURL, true)
 	if err != nil {
-		return nil, nil, fmt.Errorf("sso signin page: %w", err)
+		return "", fmt.Errorf("sso signin page: %w", err)
 	}
 
 	csrf := csrfRe.FindStringSubmatch(body)
 	if csrf == nil {
-		return nil, nil, fmt.Errorf("CSRF token not found in signin page")
+		return "", fmt.Errorf("CSRF token not found in signin page")
 	}
 
 	// 5. POST /sso/signin — submit credentials
@@ -160,52 +190,81 @@ func Login(email, password, domain string) (*OAuth1Token, *OAuth2Token, error) {
 		"embed":    {"true"},
 		"_csrf":    {csrf[1]},
 	}
-
-	body, err = sess.post(
-		ssoBase+"/sso/signin?"+signinParams.Encode(),
-		formData,
-		true,
-	)
+	body, err = sess.post(signinURL, formData, true)
 	if err != nil {
-		return nil, nil, fmt.Errorf("sso login: %w", err)
+		return "", fmt.Errorf("sso login: %w", err)
 	}
 
-	// 6. Check result title
-	titleMatch := titleRe.FindStringSubmatch(body)
-	if titleMatch == nil {
-		return nil, nil, fmt.Errorf("no title in response — login may have failed")
+	// 6. Check result title; a two-factor account lands on the MFA page first
+	title, err := pageTitle(body)
+	if err != nil {
+		return "", err
 	}
-
-	title := titleMatch[1]
 	if strings.Contains(title, "MFA") {
-		return nil, nil, fmt.Errorf(
-			"MFA is required but not yet supported in this tool.\n" +
-				"  Disable MFA temporarily, or use the Python version")
+		if body, err = submitMFA(sess, ssoBase, signinParams, body, promptMFA); err != nil {
+			return "", err
+		}
+		if title, err = pageTitle(body); err != nil {
+			return "", err
+		}
+		if strings.Contains(title, "MFA") {
+			return "", fmt.Errorf("2FA-Code wurde von Garmin abgelehnt (falsch oder abgelaufen)")
+		}
 	}
 	if title != "Success" {
-		return nil, nil, fmt.Errorf("login failed: %q (check credentials)", title)
+		return "", fmt.Errorf("login failed: %q (check credentials)", title)
 	}
 
 	// 7. Parse ticket from response
 	ticketMatch := ticketRe.FindStringSubmatch(body)
 	if ticketMatch == nil {
-		return nil, nil, fmt.Errorf("ticket not found in response")
+		return "", fmt.Errorf("ticket not found in response")
 	}
-	ticket := ticketMatch[1]
+	return ticketMatch[1], nil
+}
 
-	// 8. Get OAuth1 token via OAuth1-signed request
-	oauth1Token, err := getOAuth1Token(consumer, ticket, domain)
+// submitMFA asks for the two-factor code and posts it with the CSRF token of
+// the MFA page. It returns the body of the page Garmin answers with.
+func submitMFA(sess *ssoSession, ssoBase string, signinParams url.Values, mfaPage string, promptMFA MFAPrompt) (string, error) {
+	if promptMFA == nil {
+		return "", ErrMFARequired
+	}
+	csrf := csrfRe.FindStringSubmatch(mfaPage)
+	if csrf == nil {
+		return "", fmt.Errorf("CSRF token not found in MFA page")
+	}
+
+	code, err := promptMFA()
 	if err != nil {
-		return nil, nil, fmt.Errorf("oauth1 token: %w", err)
+		return "", fmt.Errorf("2FA-Code: %w", err)
+	}
+	code = strings.ReplaceAll(strings.TrimSpace(code), " ", "")
+	if code == "" {
+		return "", fmt.Errorf("2FA-Code: kein Code eingegeben")
 	}
 
-	// 9. Exchange OAuth1 for OAuth2 Bearer token
-	oauth2Token, err := exchangeOAuth2(consumer, oauth1Token, domain)
+	body, err := sess.post(
+		ssoBase+"/sso/verifyMFA/loginEnterMfaCode?"+signinParams.Encode(),
+		url.Values{
+			"mfa-code": {code},
+			"embed":    {"true"},
+			"_csrf":    {csrf[1]},
+			"fromPage": {"setupEnterMfaCode"},
+		},
+		true,
+	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("oauth2 exchange: %w", err)
+		return "", fmt.Errorf("sso mfa: %w", err)
 	}
+	return body, nil
+}
 
-	return oauth1Token, oauth2Token, nil
+func pageTitle(body string) (string, error) {
+	m := titleRe.FindStringSubmatch(body)
+	if m == nil {
+		return "", fmt.Errorf("no title in response — login may have failed")
+	}
+	return m[1], nil
 }
 
 // ExchangeForOAuth2 refreshes the OAuth2 token using an existing OAuth1 token.

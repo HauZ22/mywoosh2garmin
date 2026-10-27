@@ -25,6 +25,7 @@ MyWhoosh exportiert FIT-Dateien, die Garmin nicht vollständig verarbeitet:
 
 1. `mywhoosh2garmin-windows-amd64.exe` von der [Releases](../../releases)-Seite laden und starten (keine Installation nötig).
 2. MyWhoosh- und Garmin-Zugangsdaten eingeben. Passwörter werden nur für die erste Anmeldung gebraucht und **nicht gespeichert**; danach wird ein Session-Token unter `%USERPROFILE%\.mywhoosh2garmin\` wiederverwendet (Garmin: bis zu einem Jahr).
+   Ist bei Garmin die **Zwei-Faktor-Authentifizierung (2FA)** aktiv, öffnet sich beim ersten Upload ein Dialog für den Code aus der E-Mail bzw. Authenticator-App.
 3. **Fetch Activities** lädt die Fahrten der letzten Tage (Standard 10).
 4. Pro Fahrt **Upload**, oder **Upload All** für alle neuen.
 
@@ -91,6 +92,7 @@ Die Web-App kann Zugangsdaten verwalten und Uploads auslösen. Setze deshalb in 
 - Pro Fahrt **Upload** oder **Schon auf Garmin** (dauerhaft als hochgeladen merken); bei bereits markierten Fahrten **Markierung entfernen**.
 - **Alle offenen als hochgeladen markieren** und **Alle neuen synchronisieren**.
 - **Auto-Sync**: Intervall in Minuten (0 = aus). Beim Einschalten werden ältere Fahrten nie automatisch hochgeladen, sondern nur als „übersprungen“ gemerkt.
+- **Garmin 2FA**: Ist die Zwei-Faktor-Authentifizierung aktiv, erscheint beim Garmin-Login oben ein Feld für den Code (E-Mail oder Authenticator-App). Der Login wartet bis zu 10 Minuten darauf. Verlangt ein **Auto-Sync** den Code und niemand gibt ihn ein, pausiert der Auto-Sync, bis du einmal manuell synchronisierst — so kommt nicht bei jedem Intervall eine neue Code-Mail. Nach dem Login gilt die Session etwa ein Jahr, der Code ist also nur selten nötig.
 - **Datei hochladen**: FIT oder TCX (z. B. vom [JOIN Cycling](https://www.join.cc/) Workout-Player) per Drag & Drop.
 
 ### Endpunkte
@@ -101,6 +103,7 @@ Die Web-App kann Zugangsdaten verwalten und Uploads auslösen. Setze deshalb in 
 | GET | `/healthz` | Health-Check (immer ohne Login) |
 | GET | `/api/status` | Status, letzte Läufe, Log |
 | POST | `/api/config` | Zugangsdaten / Zeitfenster / Auto-Sync speichern (JSON) |
+| POST | `/api/garmin/mfa` | Garmin-2FA-Code an den wartenden Login übergeben: `{"code":"123456"}` (`409`, wenn gerade kein Code erwartet wird) |
 | GET | `/api/activities?days=N` | Fahrten mit Sync-Status |
 | POST | `/api/activities/mark` | Fahrten markieren: `{"ids":["…"],"synced":true}` (`false` = Markierung entfernen) |
 | POST | `/api/sync` · `/api/webhook/mywhoosh` | Sync aller neuen Fahrten starten |

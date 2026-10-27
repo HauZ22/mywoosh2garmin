@@ -85,6 +85,34 @@ func main() {
 	garminPasswordEntry := widget.NewPasswordEntry()
 	garminPasswordEntry.SetPlaceHolder("Garmin password (only needed first time)")
 
+	// Garmin 2FA: the login runs in a background job, which blocks here until
+	// the code was entered in a dialog.
+	syncer.SetGarminMFAPrompt(func() (string, error) {
+		type answer struct {
+			code string
+			ok   bool
+		}
+		result := make(chan answer, 1)
+		fyne.Do(func() {
+			codeEntry := widget.NewEntry()
+			codeEntry.SetPlaceHolder("123456")
+			items := []*widget.FormItem{
+				widget.NewFormItem("Code", codeEntry),
+				widget.NewFormItem("", widget.NewLabel("Garmin sent a code by e-mail\nor shows it in your authenticator app.")),
+			}
+			d := dialog.NewForm("Garmin two-factor code", "Confirm", "Cancel", items, func(ok bool) {
+				result <- answer{codeEntry.Text, ok}
+			}, w)
+			d.Show()
+			w.Canvas().Focus(codeEntry)
+		})
+		a := <-result
+		if !a.ok {
+			return "", errors.New("cancelled")
+		}
+		return a.code, nil
+	})
+
 	// applyCredentials hands the entered accounts to the syncer. Only the e-mail
 	// addresses are written to disk; passwords stay in memory.
 	applyCredentials := func() {

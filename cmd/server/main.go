@@ -7,7 +7,8 @@
 //	HTTP_ADDR            listen address, default ":8080"
 //	DATA_DIR             state directory (config, tokens, synced.json), default "./data"
 //	GARMIN_EMAIL         Garmin Connect account
-//	GARMIN_PASSWORD      Garmin Connect password (only needed for first login)
+//	GARMIN_PASSWORD      Garmin Connect password (only needed for first login;
+//	                     a 2FA code, if required, is entered in the web UI)
 //	MYWHOOSH_EMAIL       MyWhoosh account
 //	MYWHOOSH_PASSWORD    MyWhoosh password
 //	SYNC_DAYS            default MyWhoosh look-back window, default 10
@@ -51,6 +52,9 @@ var staticFiles embed.FS
 const (
 	ringCapacity = 500
 	maxUploadMB  = 64
+
+	// defaultMFATimeout is how long a Garmin login waits for the 2FA code.
+	defaultMFATimeout = 10 * time.Minute
 )
 
 // logRing is a bounded, thread-safe in-memory log.
@@ -100,6 +104,13 @@ type server struct {
 	busy        bool
 	lastSummary core.Summary
 	lastUpload  core.ItemResult
+
+	// Garmin 2FA: mfaCode is non-nil while a login waits for the code from the
+	// web UI. mfaMissed pauses auto-sync after an unanswered prompt, so it
+	// doesn't trigger a new code e-mail every interval.
+	mfaCode    chan string
+	mfaMissed  bool
+	mfaTimeout time.Duration // 0 = defaultMFATimeout
 }
 
 func env(key, def string) string {
@@ -144,6 +155,7 @@ func main() {
 		authUser: env("AUTH_USER", "admin"),
 		authPass: os.Getenv("AUTH_PASSWORD"),
 	}
+	syncer.SetGarminMFAPrompt(s.promptMFA)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -236,6 +248,7 @@ func (s *server) routes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("POST /api/config", s.handleConfig)
+	mux.HandleFunc("POST /api/garmin/mfa", s.handleMFA)
 	mux.HandleFunc("GET /api/activities", s.handleActivities)
 	mux.HandleFunc("POST /api/activities/mark", s.handleMarkActivities)
 	mux.HandleFunc("POST /api/sync/activity", s.handleSyncActivity)
@@ -304,6 +317,8 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	busy := s.busy
 	lastSummary := s.lastSummary
 	lastUpload := s.lastUpload
+	mfaPending := s.mfaCode != nil
+	mfaMissed := s.mfaMissed
 	s.mu.Unlock()
 
 	var summaryResp interface{}
@@ -321,6 +336,8 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"config":       s.statusConfig(),
 		"last_summary": summaryResp,
 		"last_upload":  uploadResp,
+		"mfa_pending":  mfaPending,
+		"mfa_missed":   mfaMissed,
 		"log":          s.log.tail(2000),
 	})
 }
@@ -376,6 +393,36 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	s.respondJSON(w, http.StatusOK, s.statusConfig())
 }
 
+// handleMFA passes the Garmin 2FA code to the login that is waiting for it.
+func (s *server) handleMFA(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10)).Decode(&body); err != nil {
+		s.respondError(w, http.StatusBadRequest, "ungültiger JSON-Body: "+err.Error())
+		return
+	}
+	code := strings.TrimSpace(body.Code)
+	if code == "" {
+		s.respondError(w, http.StatusBadRequest, "code fehlt")
+		return
+	}
+
+	s.mu.Lock()
+	ch := s.mfaCode
+	s.mu.Unlock()
+	if ch == nil {
+		s.respondError(w, http.StatusConflict, "es wird gerade kein 2FA-Code erwartet")
+		return
+	}
+	select {
+	case ch <- code:
+		s.respondJSON(w, http.StatusOK, map[string]bool{"accepted": true})
+	default:
+		s.respondError(w, http.StatusConflict, "2FA-Code wurde bereits übermittelt")
+	}
+}
+
 func (s *server) handleActivities(w http.ResponseWriter, r *http.Request) {
 	days := 0 // 0 = configured default
 	if d, err := strconv.Atoi(r.URL.Query().Get("days")); err == nil && d > 0 {
@@ -428,7 +475,7 @@ func (s *server) handleSyncActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.tryLock() {
+	if !s.tryLockManual() {
 		s.respondError(w, http.StatusConflict, "ein Sync läuft bereits")
 		return
 	}
@@ -437,7 +484,7 @@ func (s *server) handleSyncActivity(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleSync(w http.ResponseWriter, r *http.Request) {
-	if !s.tryLock() {
+	if !s.tryLockManual() {
 		s.respondError(w, http.StatusConflict, "ein Sync läuft bereits")
 		return
 	}
@@ -446,7 +493,7 @@ func (s *server) handleSync(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	if !s.tryLock() {
+	if !s.tryLockManual() {
 		s.respondError(w, http.StatusConflict, "ein Sync läuft bereits")
 		return
 	}
@@ -507,6 +554,48 @@ func (s *server) tryLock() bool {
 	return true
 }
 
+// tryLockManual is tryLock for user-triggered jobs. Such a job can answer a 2FA
+// prompt again, so it also lifts the auto-sync pause after a missed prompt.
+func (s *server) tryLockManual() bool {
+	if !s.tryLock() {
+		return false
+	}
+	s.mu.Lock()
+	s.mfaMissed = false
+	s.mu.Unlock()
+	return true
+}
+
+// promptMFA waits for the Garmin 2FA code submitted via POST /api/garmin/mfa.
+// It runs inside a job, so the busy lock is held while it waits.
+func (s *server) promptMFA() (string, error) {
+	timeout := s.mfaTimeout
+	if timeout <= 0 {
+		timeout = defaultMFATimeout
+	}
+	ch := make(chan string, 1)
+	s.mu.Lock()
+	s.mfaCode = ch
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.mfaCode = nil
+		s.mu.Unlock()
+	}()
+
+	s.log.add("🔐 Bitte den Garmin-2FA-Code in der Web-App eingeben (wartet max. %d min)", int(timeout.Minutes()))
+	select {
+	case code := <-ch:
+		return code, nil
+	case <-time.After(timeout):
+		s.mu.Lock()
+		s.mfaMissed = true
+		s.mu.Unlock()
+		s.log.add("⏸ Kein 2FA-Code eingegeben — Auto-Sync pausiert, bis ein Sync manuell gestartet wird")
+		return "", fmt.Errorf("kein Code innerhalb von %s eingegeben", timeout)
+	}
+}
+
 func (s *server) release() {
 	s.mu.Lock()
 	s.busy = false
@@ -529,6 +618,12 @@ func (s *server) autoSyncLoop(ctx context.Context) {
 		interval := s.syncer.Config().AutoSyncInterval
 		if interval <= 0 || time.Since(lastSync) < time.Duration(interval)*time.Minute {
 			continue
+		}
+		s.mu.Lock()
+		paused := s.mfaMissed
+		s.mu.Unlock()
+		if paused {
+			continue // waiting for a manual sync to answer the Garmin 2FA prompt
 		}
 		if !s.tryLock() {
 			continue // a manual job is running; try again next tick

@@ -33,6 +33,9 @@
   #drop { border:2px dashed var(--line); border-radius:8px; padding:22px; text-align:center; color:var(--muted); margin-bottom:10px; cursor:pointer; }
   #drop.hover { border-color:var(--accent); color:var(--text); }
   .muted { color:var(--muted); font-size:12px; }
+  #mfaSection { border-color:var(--warn); }
+  #mfaSection form { display:flex; gap:10px; max-width:360px; }
+  #mfaSection input { font-size:18px; letter-spacing:.2em; }
 </style>
 </head>
 <body>
@@ -42,6 +45,17 @@
   <button id="refreshBtn" class="ghost">Status</button>
 </header>
 <main>
+  <section id="mfaSection" hidden>
+    <h2>Garmin 2FA-Code</h2>
+    <p class="muted">Garmin verlangt eine Bestätigung. Gib den Code ein, den du per E-Mail oder in deiner Authenticator-App bekommen hast.</p>
+    <form id="mfaForm">
+      <input id="mfaCode" inputmode="numeric" autocomplete="one-time-code" placeholder="123456">
+      <button type="submit">Bestätigen</button>
+    </form>
+    <div id="mfaMsg" class="status"></div>
+  </section>
+  <div id="mfaMissed" class="status" hidden style="margin-bottom:16px"><span class="badge warn">Auto-Sync pausiert</span>Der Garmin-2FA-Code wurde nicht rechtzeitig eingegeben. Starte einen Sync manuell, um dich erneut anzumelden.</div>
+
   <section id="cfgSection">
     <h2>Konten</h2>
     <div class="row">
@@ -125,6 +139,9 @@ async function refresh() {
   $('saveCfg').disabled = s.busy;
   $('fetchActivitiesBtn').disabled = s.busy;
   $('version').textContent = s.version && s.version !== 'dev' ? s.version : '';
+  if (s.mfa_pending && $('mfaSection').hidden) { $('mfaMsg').textContent = ''; $('mfaSection').hidden = false; $('mfaCode').focus(); }
+  if (!s.mfa_pending) $('mfaSection').hidden = true;
+  $('mfaMissed').hidden = !s.mfa_missed;
 
   if (!configLoaded) {
     if (!document.activeElement || document.activeElement.id !== 'mwEmail') $('mwEmail').value = s.config.mywhoosh_email || '';
@@ -182,6 +199,18 @@ $('saveCfg').onclick = async () => {
   }
   catch (e) { $('cfgMsg').textContent = '✗ ' + e.message; }
   refresh();
+};
+
+$('mfaForm').onsubmit = async e => {
+  e.preventDefault();
+  const code = $('mfaCode').value.trim();
+  if (!code) return;
+  try {
+    await api('/api/garmin/mfa', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ code }) });
+    $('mfaCode').value = '';
+    $('mfaMsg').innerHTML = '<span class="badge ok">Code gesendet</span>';
+  } catch (err) { $('mfaMsg').innerHTML = '<span class="err">' + escapeHtml(err.message) + '</span>'; }
+  refresh().catch(() => {});
 };
 
 $('syncBtn').onclick = async () => {

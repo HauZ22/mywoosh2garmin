@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"mywhoosh2garmin/internal/core"
 )
@@ -329,5 +330,76 @@ func TestProbe(t *testing.T) {
 	ts.Close()
 	if code := probe(strings.TrimPrefix(ts.URL, "http://")); code != 1 {
 		t.Errorf("probe of stopped server = %d, want 1", code)
+	}
+}
+
+func TestMFAPromptReceivesCodeFromWebUI(t *testing.T) {
+	s := newTestServer(t)
+	_, do := newTestMux(s)
+
+	if rr := postJSON(do, "/api/garmin/mfa", `{"code":"123456"}`); rr.Code != http.StatusConflict {
+		t.Fatalf("code without pending login: status %d, want 409", rr.Code)
+	}
+
+	got := make(chan string, 1)
+	go func() {
+		code, err := s.promptMFA()
+		if err != nil {
+			t.Errorf("promptMFA: %v", err)
+		}
+		got <- code
+	}()
+
+	waitFor(t, func() bool { return statusField(t, do, "mfa_pending") == true })
+	if rr := postJSON(do, "/api/garmin/mfa", `{"code":"  "}`); rr.Code != http.StatusBadRequest {
+		t.Errorf("empty code: status %d, want 400", rr.Code)
+	}
+	if rr := postJSON(do, "/api/garmin/mfa", `{"code":"123456"}`); rr.Code != http.StatusOK {
+		t.Fatalf("submit code: status %d: %s", rr.Code, rr.Body.String())
+	}
+	if code := <-got; code != "123456" {
+		t.Errorf("prompt returned %q", code)
+	}
+	waitFor(t, func() bool { return statusField(t, do, "mfa_pending") == false })
+}
+
+func TestMFATimeoutPausesAutoSyncUntilManualSync(t *testing.T) {
+	s := newTestServer(t)
+	s.mfaTimeout = 10 * time.Millisecond
+	_, do := newTestMux(s)
+
+	if _, err := s.promptMFA(); err == nil {
+		t.Fatal("promptMFA succeeded without a code")
+	}
+	if statusField(t, do, "mfa_missed") != true {
+		t.Fatal("mfa_missed not set after timeout")
+	}
+
+	if !s.tryLockManual() {
+		t.Fatal("tryLockManual failed")
+	}
+	s.release()
+	if statusField(t, do, "mfa_missed") != false {
+		t.Error("manual job did not lift the auto-sync pause")
+	}
+}
+
+func statusField(t *testing.T, do func(*http.Request) *httptest.ResponseRecorder, key string) interface{} {
+	t.Helper()
+	var body map[string]interface{}
+	if err := json.Unmarshal(do(httptest.NewRequest(http.MethodGet, "/api/status", nil)).Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	return body[key]
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not reached")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

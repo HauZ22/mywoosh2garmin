@@ -158,6 +158,8 @@ type Syncer struct {
 	garmin *garmin.Client
 	mw     *mywhoosh.Client
 
+	promptMFA garmin.MFAPrompt // asks for the Garmin 2FA code; nil = not possible
+
 	knownMu sync.Mutex
 	known   map[string]mywhoosh.Activity // last fetched activities by ID
 }
@@ -178,6 +180,12 @@ func (s *Syncer) SetLog(fn LogFn) {
 	if fn != nil {
 		s.log = fn
 	}
+}
+
+// SetGarminMFAPrompt sets how the Garmin two-factor code is obtained when a
+// fresh login needs one. Call it before starting any operation.
+func (s *Syncer) SetGarminMFAPrompt(fn garmin.MFAPrompt) {
+	s.promptMFA = fn
 }
 
 // DataDir returns the persistent state directory.
@@ -522,6 +530,13 @@ func (s *Syncer) ensureGarmin() error {
 	cfg := s.Config()
 	if cfg.GarminEmail == "" || cfg.GarminPassword == "" {
 		return fmt.Errorf("Garmin ist nicht eingerichtet — E-Mail & Passwort erforderlich")
+	}
+
+	if s.promptMFA != nil {
+		client.PromptMFA = func() (string, error) {
+			s.log("🔐 Garmin verlangt einen 2FA-Code (per E-Mail oder Authenticator-App)…")
+			return s.promptMFA()
+		}
 	}
 
 	s.log("Garmin Login…")

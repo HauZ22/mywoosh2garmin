@@ -30,6 +30,10 @@ type Client struct {
 	Domain   string
 	TokenDir string // directory where tokens are cached
 
+	// PromptMFA supplies the two-factor code during Login; nil means accounts
+	// with 2FA cannot log in.
+	PromptMFA MFAPrompt
+
 	apiBaseURL   string        // injectable in tests; defaults to connectapi.<Domain>
 	httpClient   *http.Client  // injectable in tests
 	pollInterval time.Duration // injectable in tests
@@ -85,7 +89,7 @@ func (c *Client) Resume() error {
 
 // Login performs a fresh SSO login with the given credentials.
 func (c *Client) Login(email, password string) error {
-	oauth1, oauth2, err := Login(email, password, c.Domain)
+	oauth1, oauth2, err := Login(email, password, c.Domain, c.PromptMFA)
 	if err != nil {
 		return err
 	}
