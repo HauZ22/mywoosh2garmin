@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"mywhoosh2garmin/internal/device"
 )
 
 func TestFixTcx(t *testing.T) {
@@ -16,7 +18,7 @@ func TestFixTcx(t *testing.T) {
 		t.Fatalf("fixture too small: %d bytes", len(raw))
 	}
 
-	fixed, err := FixTcx(raw)
+	fixed, err := FixTcx(raw, device.Identity{})
 	if err != nil {
 		t.Fatalf("FixTcx failed: %v", err)
 	}
@@ -59,7 +61,7 @@ func TestFixTcxNoAuthorStillWorks(t *testing.T) {
 	if findAuthor(noAuthor) {
 		t.Fatal("removeAuthor did not strip the author block")
 	}
-	fixed, err := FixTcx(noAuthor)
+	fixed, err := FixTcx(noAuthor, device.Identity{})
 	if err != nil {
 		t.Fatalf("FixTcx on author-less file: %v", err)
 	}
@@ -69,17 +71,33 @@ func TestFixTcxNoAuthorStillWorks(t *testing.T) {
 }
 
 func TestFixTcxErrors(t *testing.T) {
-	if _, err := FixTcx([]byte("")); err == nil {
+	if _, err := FixTcx([]byte(""), device.Identity{}); err == nil {
 		t.Error("expected error for empty input")
 	}
-	if _, err := FixTcx([]byte("<foo/>")); err == nil {
+	if _, err := FixTcx([]byte("<foo/>"), device.Identity{}); err == nil {
 		t.Error("expected error for non-TCX input")
 	}
-	if _, err := FixTcx([]byte("<TrainingCenterDatabase xmlns=\"x\"><Activities/></TrainingCenterDatabase>")); err == nil {
+	if _, err := FixTcx([]byte("<TrainingCenterDatabase xmlns=\"x\"><Activities/></TrainingCenterDatabase>"), device.Identity{}); err == nil {
 		t.Error("expected error for TCX without <Activity>")
 	}
 }
 
 func findAuthor(data []byte) bool {
 	return strings.Contains(string(data), "<Author")
+}
+
+func TestFixTcxUsesGivenDevice(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "join_workout.tcx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := device.Identity{Name: "fenix 8 - 47mm, Solar", Product: 4532, SerialNumber: 3500000001, SoftwareVersion: 2339}
+	fixed, err := FixTcx(raw, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `<Name>fenix 8 - 47mm, Solar</Name><UnitId>3500000001</UnitId><ProductID>4532</ProductID><Version><VersionMajor>23</VersionMajor><VersionMinor>39</VersionMinor>`
+	if !strings.Contains(string(fixed), want) {
+		t.Errorf("creator block does not carry the given device")
+	}
 }

@@ -19,7 +19,8 @@ MyWhoosh exportiert FIT-Dateien, die Garmin nicht vollständig verarbeitet:
 |---|---|
 | Durchschnittsleistung / -puls / -kadenz fehlen | werden aus den Aufzeichnungen berechnet |
 | Falsche Temperaturwerte in jedem Datensatz | werden entfernt |
-| Unbekanntes Gerät → Garmin ignoriert Training Effect & VO2max | Gerät wird als Garmin Fenix 6S Pro eingetragen |
+| Unbekanntes Gerät → Garmin ignoriert Training Effect & VO2max | Dein **primäres Trainingsgerät** aus Garmin Connect (Modell, Unit-ID, Firmware) wird als Aufzeichnungsgerät eingetragen — so landen VO2max & Co. bei deiner Uhr (Physio TrueUp) |
+| Falsche Zeitstempel (Ende = Start, lokale Zeit in falscher Epoche), leeres Start-Event | werden korrigiert, Timer-Start/-Stopp ergänzt |
 
 ## Windows-App
 
@@ -137,9 +138,12 @@ curl -X POST http://localhost:8080/api/webhook/upload \
 
 ### JOIN Cycling (TCX)
 
-Der JOIN Workout-Player exportiert TCX-Dateien, die Garmin Connect nicht direkt annimmt. Der Server entfernt den JOIN-Author-Block und trägt ein Garmin-Gerät (Fenix 6S Pro) als `<Creator>` ein. Die Trackdaten (Leistung, Puls, Kadenz, Geschwindigkeit) bleiben unverändert.
+Der JOIN Workout-Player exportiert TCX-Dateien, die Garmin Connect nicht direkt annimmt. Der Server entfernt den JOIN-Author-Block und trägt dein primäres Trainingsgerät als `<Creator>` ein. Die Trackdaten (Leistung, Puls, Kadenz, Geschwindigkeit) bleiben unverändert.
 
 ## Einschränkungen
+
+- Das Gerät wird beim ersten Upload aus Garmin Connect gelesen und in `device.json` im Datenordner gespeichert (alle 24 h aktualisiert). Ist kein primäres Trainingsgerät ermittelbar, wird ersatzweise eine fenix 6S eingetragen.
+- Die lokale Uhrzeit der Fahrt wird aus der Zeitzone des Rechners bestimmt. Im Docker-Container steuert das `TZ` in `.env` (Standard `Europe/Berlin`).
 
 - **Kein MFA**: Ist bei deinem Garmin-Konto die Zwei-Faktor-Anmeldung aktiv, schlägt der Login fehl.
 - Der Garmin-Login nutzt inoffizielle Schnittstellen und kann sich ohne Vorwarnung ändern.

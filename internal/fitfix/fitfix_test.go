@@ -12,6 +12,8 @@ import (
 	"github.com/muktihari/fit/profile/filedef"
 	"github.com/muktihari/fit/profile/mesgdef"
 	"github.com/muktihari/fit/profile/typedef"
+
+	"mywhoosh2garmin/internal/device"
 )
 
 // createTestFitFile creates a synthetic MyWhoosh-like FIT file with:
@@ -85,7 +87,7 @@ func TestFixFit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fixed, err := FixFit(raw, nil)
+	fixed, err := FixFit(raw, device.Identity{}, nil, nil)
 	if err != nil {
 		t.Fatalf("FixFit failed: %v", err)
 	}
@@ -158,7 +160,7 @@ func TestFixFitSpoofsDevice(t *testing.T) {
 	}
 
 	var logged int
-	fixed, err := FixFit(raw, func(string, ...interface{}) { logged++ })
+	fixed, err := FixFit(raw, device.Identity{}, nil, func(string, ...interface{}) { logged++ })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +184,134 @@ func TestFixFitSpoofsDevice(t *testing.T) {
 }
 
 func TestFixFitRejectsGarbage(t *testing.T) {
-	if _, err := FixFit([]byte("this is not a FIT file"), nil); err == nil {
+	if _, err := FixFit([]byte("this is not a FIT file"), device.Identity{}, nil, nil); err == nil {
 		t.Fatal("expected decode error")
+	}
+}
+
+// mywhooshLike builds a file with the defects seen in real MyWhoosh exports:
+// summary timestamps equal to the start time, a local_timestamp in the Unix
+// epoch, an empty first event and no device_info.
+func mywhooshLike(t *testing.T) []byte {
+	t.Helper()
+	start := time.Date(2026, 10, 6, 17, 4, 47, 0, time.UTC)
+	const n = 600
+
+	a := filedef.NewActivity()
+	a.FileId.SetType(typedef.FileActivity).SetTimeCreated(start).
+		SetManufacturer(typedef.Manufacturer(331)).SetProduct(3570).SetSerialNumber(3313379353)
+	a.Events = append(a.Events, mesgdef.NewEvent(nil).SetTimestamp(start))
+	for i := 0; i < n; i++ {
+		a.Records = append(a.Records, mesgdef.NewRecord(nil).
+			SetTimestamp(start.Add(time.Duration(i)*time.Second)).
+			SetPower(200).SetHeartRate(150).SetCadence(90))
+	}
+	end := start.Add((n - 1) * time.Second)
+	a.Events = append(a.Events, mesgdef.NewEvent(nil).SetTimestamp(end).
+		SetEvent(typedef.EventSession).SetEventType(typedef.EventTypeStopDisableAll))
+	a.Laps = append(a.Laps, mesgdef.NewLap(nil).SetStartTime(start).SetTimestamp(end).
+		SetTotalElapsedTime((n-1)*1000).SetTotalTimerTime((n-1)*1000))
+	a.Sessions = append(a.Sessions, mesgdef.NewSession(nil).SetTimestamp(start).SetStartTime(start).
+		SetTotalElapsedTime((n-1)*1000).SetTotalTimerTime((n-1)*1000).
+		SetSport(typedef.SportCycling).SetSubSport(typedef.SubSportVirtualActivity))
+	a.Activity = mesgdef.NewActivity(nil).SetTimestamp(start).SetNumSessions(1).
+		SetType(typedef.ActivityManual).
+		SetLocalTimestamp(time.Unix(end.Unix()+631065600, 0)) // wrong epoch, as MyWhoosh does
+
+	fit := a.ToFIT(nil)
+	var buf bytes.Buffer
+	if err := encoder.New(&buf).Encode(&fit); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func decodeActivity(t *testing.T, data []byte) *filedef.Activity {
+	t.Helper()
+	lis := filedef.NewListener()
+	t.Cleanup(lis.Close)
+	dec := decoder.New(bytes.NewReader(data), decoder.WithMesgListener(lis), decoder.WithBroadcastOnly())
+	if _, err := dec.Decode(); err != nil {
+		t.Fatal(err)
+	}
+	return lis.File().(*filedef.Activity)
+}
+
+func TestFixFitWritesUserDeviceAndRepairsTimes(t *testing.T) {
+	id := device.Identity{Name: "fenix 8 - 47mm, Solar", Product: 4532, SerialNumber: 3500000001, SoftwareVersion: 2339}
+	berlin := time.FixedZone("CET", 3600)
+
+	fixed, err := FixFit(mywhooshLike(t), id, berlin, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := decodeActivity(t, fixed)
+
+	if a.FileId.Manufacturer != typedef.ManufacturerGarmin || a.FileId.Product != 4532 || a.FileId.SerialNumber != 3500000001 {
+		t.Errorf("file_id = %v/%d/%d", a.FileId.Manufacturer, a.FileId.Product, a.FileId.SerialNumber)
+	}
+
+	if len(a.DeviceInfos) != 1 {
+		t.Fatalf("device_info count = %d, want 1", len(a.DeviceInfos))
+	}
+	di := a.DeviceInfos[0]
+	if di.DeviceIndex != typedef.DeviceIndexCreator || di.Product != 4532 || di.SerialNumber != 3500000001 ||
+		di.SoftwareVersion != 2339 || di.SourceType != typedef.SourceTypeLocal {
+		t.Errorf("creator device_info = %+v", di)
+	}
+
+	start := a.Sessions[0].StartTime
+	end := start.Add(599 * time.Second)
+	if !a.Sessions[0].Timestamp.Equal(end) {
+		t.Errorf("session timestamp = %v, want %v", a.Sessions[0].Timestamp, end)
+	}
+	if !a.Activity.Timestamp.Equal(end) {
+		t.Errorf("activity timestamp = %v, want %v", a.Activity.Timestamp, end)
+	}
+	if got := a.Activity.LocalTimestamp.Sub(a.Activity.Timestamp); got != time.Hour {
+		t.Errorf("local_timestamp offset = %v, want 1h", got)
+	}
+
+	var startEv, stopEv bool
+	for i, e := range a.Events {
+		if e.Event == typedef.EventTimer && e.EventType == typedef.EventTypeStart && i == 0 && e.Timestamp.Equal(start) {
+			startEv = true
+		}
+		if e.Event == typedef.EventTimer && e.EventType == typedef.EventTypeStopAll && e.Timestamp.Equal(end) {
+			stopEv = true
+		}
+	}
+	if !startEv || !stopEv {
+		t.Errorf("timer events start=%v stop=%v (events: %d)", startEv, stopEv, len(a.Events))
+	}
+	if len(a.Events) != 3 {
+		t.Errorf("event count = %d, want 3", len(a.Events))
+	}
+}
+
+func TestFixFitKeepsSensorDeviceInfos(t *testing.T) {
+	raw := mywhooshLike(t)
+	a := decodeActivity(t, raw)
+	sensor := mesgdef.NewDeviceInfo(nil).SetTimestamp(a.Sessions[0].StartTime).
+		SetDeviceIndex(1).SetManufacturer(typedef.ManufacturerWahooFitness).SetProduct(42).SetSerialNumber(777)
+	a.DeviceInfos = append(a.DeviceInfos, sensor)
+	fit := a.ToFIT(nil)
+	var buf bytes.Buffer
+	if err := encoder.New(&buf).Encode(&fit); err != nil {
+		t.Fatal(err)
+	}
+
+	fixed, err := FixFit(buf.Bytes(), device.Identity{Name: "x", Product: 4532, SerialNumber: 1, SoftwareVersion: 100}, time.UTC, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := decodeActivity(t, fixed)
+	if len(out.DeviceInfos) != 2 {
+		t.Fatalf("device_info count = %d, want 2", len(out.DeviceInfos))
+	}
+	for _, di := range out.DeviceInfos {
+		if di.DeviceIndex == 1 && (di.Manufacturer != typedef.ManufacturerWahooFitness || di.SerialNumber != 777) {
+			t.Errorf("sensor device_info was modified: %+v", di)
+		}
 	}
 }
