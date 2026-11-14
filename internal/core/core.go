@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"mywhoosh2garmin/garmin"
+	"mywhoosh2garmin/internal/device"
 	"mywhoosh2garmin/internal/fitfix"
 	"mywhoosh2garmin/internal/tcx"
 	"mywhoosh2garmin/mywhoosh"
@@ -162,6 +163,9 @@ type Syncer struct {
 
 	knownMu sync.Mutex
 	known   map[string]mywhoosh.Activity // last fetched activities by ID
+
+	dev   device.Identity // device written into patched files (guarded by opMu)
+	devAt time.Time       // when dev was last read from Garmin Connect
 }
 
 // New creates a Syncer rooted at dataDir (tokens, config.json, synced.json).
@@ -459,7 +463,7 @@ func (s *Syncer) processActivity(act mywhoosh.Activity, isAutoSync bool) (ItemRe
 	}
 	s.log("  ✓ %d Bytes heruntergeladen", len(fitData))
 
-	fixed, err := fitfix.FixFit(fitData, fitfix.LogFunc(s.log))
+	fixed, err := fitfix.FixFit(fitData, s.deviceIdentity(), nil, fitfix.LogFunc(s.log))
 	if err != nil {
 		return fail("FIT-Fix fehlgeschlagen: ", err)
 	}
@@ -547,6 +551,53 @@ func (s *Syncer) ensureGarmin() error {
 	return nil
 }
 
+// deviceRefresh is how long a device identity read from Garmin is reused.
+const deviceRefresh = 24 * time.Hour
+
+// deviceIdentity returns the Garmin device written into patched files: the
+// account's primary training device (product, unit ID, firmware), read from
+// Garmin Connect and cached in device.json. If it cannot be determined, the
+// cached value or device.Fallback is used. The caller must hold opMu.
+func (s *Syncer) deviceIdentity() device.Identity {
+	if s.dev.Valid() && time.Since(s.devAt) < deviceRefresh {
+		return s.dev
+	}
+
+	if err := s.ensureGarmin(); err == nil {
+		d, err := s.garmin.PrimaryTrainingDevice()
+		if err == nil {
+			id := device.Identity{
+				Name:            d.DisplayName,
+				Product:         d.ProductID(),
+				SerialNumber:    d.UnitID,
+				SoftwareVersion: d.SoftwareVersion(),
+			}
+			if id.SoftwareVersion == 0 {
+				id.SoftwareVersion = device.Fallback.SoftwareVersion
+			}
+			if id != s.dev {
+				s.log("  Garmin-Gerät: %s", id)
+			}
+			s.dev, s.devAt = id, time.Now()
+			if err := device.Save(s.dataDir, id); err != nil {
+				s.log("  ⚠ Gerät konnte nicht gespeichert werden: %v", err)
+			}
+			return id
+		}
+		s.log("  ⚠ Primäres Trainingsgerät nicht ermittelbar: %v", err)
+	}
+
+	if s.dev.Valid() {
+		return s.dev
+	}
+	if id, ok := device.Load(s.dataDir); ok {
+		s.dev = id
+		return id
+	}
+	s.log("  ⚠ Nutze Ersatzgerät %s — VO2max wird evtl. nicht deiner Uhr zugeordnet", device.Fallback)
+	return device.Fallback
+}
+
 // ensureMyWhoosh logs in to MyWhoosh, resuming a cached session if possible.
 func (s *Syncer) ensureMyWhoosh() error {
 	if s.mw == nil {
@@ -599,7 +650,7 @@ func (s *Syncer) UploadFileBytes(name string, data []byte) (ItemResult, error) {
 			item.Status = StatusDuplicate
 			return item, nil
 		}
-		if fixed, err = tcx.FixTcx(data); err != nil {
+		if fixed, err = tcx.FixTcx(data, s.deviceIdentity()); err != nil {
 			return ItemResult{Name: name, Status: StatusFailed, Message: "TCX-Fix: " + err.Error()}, err
 		}
 	case ".fit":
@@ -608,7 +659,7 @@ func (s *Syncer) UploadFileBytes(name string, data []byte) (ItemResult, error) {
 			item.Status = StatusDuplicate
 			return item, nil
 		}
-		if fixed, err = fitfix.FixFit(data, fitfix.LogFunc(s.log)); err != nil {
+		if fixed, err = fitfix.FixFit(data, s.deviceIdentity(), nil, fitfix.LogFunc(s.log)); err != nil {
 			return ItemResult{Name: name, Status: StatusFailed, Message: "FIT-Fix: " + err.Error()}, err
 		}
 	default:

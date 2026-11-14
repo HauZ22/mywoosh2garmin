@@ -19,7 +19,10 @@ const closingActivity = "</Activity>"
 //  2. inserts a Garmin device <Creator> block before every </Activity> tag.
 //
 // The track points, laps and all timing/power/HR/cadence data are preserved.
-func FixTcx(data []byte) ([]byte, error) {
+func FixTcx(data []byte, id device.Identity) ([]byte, error) {
+	if !id.Valid() {
+		id = device.Fallback
+	}
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil, errors.New("empty TCX file")
 	}
@@ -28,7 +31,7 @@ func FixTcx(data []byte) ([]byte, error) {
 	}
 
 	out := removeAuthor(data)
-	creatorXML := []byte(device.CreatorXML())
+	creatorXML := []byte(id.CreatorXML())
 
 	var b bytes.Buffer
 	b.Grow(len(out) + len(creatorXML))
