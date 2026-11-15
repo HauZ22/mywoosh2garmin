@@ -43,6 +43,10 @@ type Config struct {
 	Days                int    `json:"days,omitempty"`
 	AutoSyncInterval    int    `json:"auto_sync_interval,omitempty"`
 	AutoSyncActivatedAt int64  `json:"auto_sync_activated_at,omitempty"`
+	DeviceName          string `json:"device_name,omitempty"`
+	DeviceProduct       uint16 `json:"device_product,omitempty"`
+	DeviceSerial        uint32 `json:"device_serial,omitempty"`
+	DeviceFirmware      uint16 `json:"device_firmware,omitempty"`
 }
 
 // DefaultDays is the activity look-back window used when Days is unset.
@@ -559,6 +563,18 @@ const deviceRefresh = 24 * time.Hour
 // Garmin Connect and cached in device.json. If it cannot be determined, the
 // cached value or device.Fallback is used. The caller must hold opMu.
 func (s *Syncer) deviceIdentity() device.Identity {
+	cfg := s.Config()
+	if cfg.DeviceProduct != 0 && cfg.DeviceSerial != 0 {
+		name := cfg.DeviceName
+		if name == "" {
+			name = "Garmin device"
+		}
+		firmware := cfg.DeviceFirmware
+		if firmware == 0 {
+			firmware = device.Fallback.SoftwareVersion
+		}
+		return device.Identity{Name: name, Product: cfg.DeviceProduct, SerialNumber: cfg.DeviceSerial, SoftwareVersion: firmware}
+	}
 	if s.dev.Valid() && time.Since(s.devAt) < deviceRefresh {
 		return s.dev
 	}

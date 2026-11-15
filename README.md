@@ -142,7 +142,7 @@ Der JOIN Workout-Player exportiert TCX-Dateien, die Garmin Connect nicht direkt 
 
 ## Einschränkungen
 
-- Das Gerät wird beim ersten Upload aus Garmin Connect gelesen und in `device.json` im Datenordner gespeichert (alle 24 h aktualisiert). Ist kein primäres Trainingsgerät ermittelbar, wird ersatzweise eine fenix 6S eingetragen.
+- Das Gerät wird beim ersten Upload aus Garmin Connect gelesen und in `device.json` im Datenordner gespeichert (alle 24 h aktualisiert). Alternativ kann in der Web-App ein Geräteprofil oder ein eigenes Gerät mit lokaler Unit-ID gesetzt werden; diese Werte liegen in `config.json` im Datenordner und gehören nicht ins öffentliche Repository. Ohne eigene Auswahl und ohne ermittelbares Garmin-Gerät wird weiterhin ein generisches Ersatzprofil verwendet.
 - Die lokale Uhrzeit der Fahrt wird aus der Zeitzone des Rechners bestimmt. Im Docker-Container steuert das `TZ` in `.env` (Standard `Europe/Berlin`).
 
 - **Kein MFA**: Ist bei deinem Garmin-Konto die Zwei-Faktor-Anmeldung aktiv, schlägt der Login fehl.

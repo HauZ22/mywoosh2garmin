@@ -26,11 +26,11 @@ type Identity struct {
 	SoftwareVersion uint16 `json:"software_version"` // firmware × 100 (23.39 → 2339)
 }
 
-// Fallback is used when the user's own device is unknown.
+// Fallback is used only when no account device or local override is available.
 var Fallback = Identity{
 	Name:            "fenix 6S Pro",
 	Product:         3288, // typedef.GarminProductFenix6s
-	SerialNumber:    3420897194,
+	SerialNumber:    1,
 	SoftwareVersion: 2511,
 }
 

@@ -309,6 +309,10 @@ func (s *server) statusConfig() map[string]interface{} {
 		"garmin_configured":   cfg.GarminEmail != "" && cfg.GarminPassword != "",
 		"days":                cfg.EffectiveDays(),
 		"auto_sync_interval":  cfg.AutoSyncInterval,
+		"device_name":         cfg.DeviceName,
+		"device_product":      cfg.DeviceProduct,
+		"device_serial":       cfg.DeviceSerial,
+		"device_firmware":     cfg.DeviceFirmware,
 	}
 }
 
@@ -350,6 +354,10 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		GarminPassword   string `json:"garmin_password"`
 		Days             int    `json:"days"`
 		AutoSyncInterval *int   `json:"auto_sync_interval"`
+		DeviceName       string `json:"device_name"`
+		DeviceProduct    uint16 `json:"device_product"`
+		DeviceSerial     uint32 `json:"device_serial"`
+		DeviceFirmware   uint16 `json:"device_firmware"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		s.respondError(w, http.StatusBadRequest, "ungültiger JSON-Body: "+err.Error())
@@ -382,6 +390,15 @@ func (s *server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			cfg.AutoSyncActivatedAt = time.Now().Unix()
 		}
 		cfg.AutoSyncInterval = interval
+	}
+	if body.DeviceProduct == 0 && body.DeviceSerial == 0 {
+		cfg.DeviceName, cfg.DeviceProduct, cfg.DeviceSerial, cfg.DeviceFirmware = "", 0, 0, 0
+	} else if body.DeviceProduct == 0 || body.DeviceSerial == 0 {
+		s.respondError(w, http.StatusBadRequest, "Modell/Produkt-ID und Unit-ID müssen gemeinsam angegeben werden")
+		return
+	} else {
+		cfg.DeviceName = strings.TrimSpace(body.DeviceName)
+		cfg.DeviceProduct, cfg.DeviceSerial, cfg.DeviceFirmware = body.DeviceProduct, body.DeviceSerial, body.DeviceFirmware
 	}
 
 	if err := s.syncer.SetConfig(cfg); err != nil {

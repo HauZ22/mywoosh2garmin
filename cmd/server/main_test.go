@@ -63,7 +63,7 @@ func TestConfigEndpoint(t *testing.T) {
 	s := newTestServer(t)
 	_, do := newTestMux(s)
 
-	body := `{"mywhoosh_email":"mw@x.io","mywhoosh_password":"pw-mw","garmin_email":"ga@x.io","garmin_password":"pw-ga","days":4}`
+	body := `{"mywhoosh_email":"mw@x.io","mywhoosh_password":"pw-mw","garmin_email":"ga@x.io","garmin_password":"pw-ga","days":4,"device_name":"fēnix 8 AMOLED 47 mm","device_product":4536,"device_serial":3500000001,"device_firmware":2339}`
 	rr := do(httptest.NewRequest(http.MethodPost, "/api/config", strings.NewReader(body)))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("config status = %d: %s", rr.Code, rr.Body.String())
@@ -75,6 +75,9 @@ func TestConfigEndpoint(t *testing.T) {
 	cfg := status["config"].(map[string]interface{})
 	if cfg["garmin_configured"] != true {
 		t.Errorf("garmin_configured = %v, want true", cfg["garmin_configured"])
+	}
+	if cfg["device_product"] != float64(4536) || cfg["device_serial"] != float64(3500000001) || cfg["device_name"] != "fēnix 8 AMOLED 47 mm" {
+		t.Errorf("device config was not returned: %+v", cfg)
 	}
 	if cfg["days"] != float64(4) {
 		t.Errorf("days = %v, want 4", cfg["days"])

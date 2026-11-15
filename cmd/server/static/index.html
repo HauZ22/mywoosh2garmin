@@ -76,6 +76,18 @@
         <label>Auto-Sync Intervall (Minuten, 0=Aus)</label><input id="autoSyncInterval" type="number" value="0">
       </div>
     </div>
+    <h2 style="margin-top:18px">Gerät für Aktivitäten</h2>
+    <p class="muted">Standardmäßig wird dein primäres Garmin-Gerät automatisch aus Garmin Connect gelesen. Optional kannst du es hier überschreiben. Die Unit-ID wird nur in deiner lokalen Konfiguration gespeichert.</p>
+    <label>Geräteprofil</label>
+    <select id="devicePreset" style="width:100%;padding:8px;background:#0b121a;border:1px solid var(--line);border-radius:6px;color:var(--text)">
+      <option value="auto">Primäres Gerät aus Garmin Connect (empfohlen)</option>
+      <option value="fenix8-amoled">fēnix 8 AMOLED 47 / 51 mm (Produkt 4536)</option>
+      <option value="fenix8-solar">fēnix 8 Solar 47 mm (Produkt 4532)</option>
+      <option value="fenix8-solar-large">fēnix 8 Solar 51 mm (Produkt 4533)</option>
+      <option value="custom">Eigenes Gerät / andere Variante</option>
+    </select>
+    <div class="row"><div><label>Modellname</label><input id="deviceName" placeholder="z. B. fēnix 8 47 mm"></div><div><label>FIT Produkt-ID</label><input id="deviceProduct" type="number" min="1" max="65535" placeholder="z. B. 4536"></div></div>
+    <div class="row"><div><label>Unit-ID / Seriennummer</label><input id="deviceSerial" type="number" min="1" max="4294967295" placeholder="nur lokal gespeichert"></div><div><label>Firmware-Version (optional, z. B. 23.39)</label><input id="deviceFirmware" type="text" placeholder="wird als FIT-Version gespeichert"></div></div>
     <div style="margin-top:12px"><button id="saveCfg">Konfiguration speichern</button><span id="cfgMsg" class="status muted" style="margin-left:10px"></span></div>
   </section>
 
@@ -148,6 +160,12 @@ async function refresh() {
     $('gaEmail').value = s.config.garmin_email || '';
     $('days').value = s.config.days || 10;
     $('autoSyncInterval').value = s.config.auto_sync_interval || 0;
+    $('deviceName').value = s.config.device_name || '';
+    $('deviceProduct').value = s.config.device_product || '';
+    $('deviceSerial').value = s.config.device_serial || '';
+    const fw = Number(s.config.device_firmware || 0);
+    $('deviceFirmware').value = fw ? (Math.floor(fw / 100) + '.' + String(fw % 100).padStart(2, '0')) : '';
+    $('devicePreset').value = s.config.device_product ? 'custom' : 'auto';
     configLoaded = true;
   }
   $('mwPass').placeholder = s.config.mywhoosh_configured ? 'Passwort gespeichert — leer lassen' : 'nur bei Erst-Login nötig';
@@ -181,6 +199,14 @@ function escapeHtml(s) { const d = document.createElement('div'); d.textContent 
 $('refreshBtn').onclick = () => refresh().catch(e => $('log').textContent = 'Status: ' + e.message);
 
 $('saveCfg').onclick = async () => {
+  const firmwareText = $('deviceFirmware').value.trim();
+  const firmware = firmwareText ? Math.round(parseFloat(firmwareText) * 100) : 0;
+  const product = Number($('deviceProduct').value) || 0;
+  const serial = Number($('deviceSerial').value) || 0;
+  if ((product === 0) !== (serial === 0) || product > 65535 || serial > 4294967295 || firmware < 0 || firmware > 65535 || (firmwareText && !Number.isFinite(firmware))) {
+    $('cfgMsg').textContent = '✗ Bitte Produkt-ID und Unit-ID gemeinsam sowie gültige Werte eingeben.';
+    return;
+  }
   const body = {
     mywhoosh_email: $('mwEmail').value,
     mywhoosh_password: $('mwPass').value,
@@ -188,6 +214,10 @@ $('saveCfg').onclick = async () => {
     garmin_password: $('gaPass').value,
     days: parseInt($('days').value) || 10,
     auto_sync_interval: parseInt($('autoSyncInterval').value) || 0,
+    device_name: $('deviceName').value.trim(),
+    device_product: product,
+    device_serial: serial,
+    device_firmware: firmware,
   };
   $('cfgMsg').textContent = 'Speichern…';
   try { 
@@ -199,6 +229,20 @@ $('saveCfg').onclick = async () => {
   }
   catch (e) { $('cfgMsg').textContent = '✗ ' + e.message; }
   refresh();
+};
+
+$('devicePreset').onchange = () => {
+  const presets = {
+    'fenix8-amoled': ['fēnix 8 AMOLED 47 mm', 4536],
+    'fenix8-solar': ['fēnix 8 Solar 47 mm', 4532],
+    'fenix8-solar-large': ['fēnix 8 Solar 51 mm', 4533],
+  };
+  const value = $('devicePreset').value;
+  if (value === 'auto') {
+    $('deviceName').value = ''; $('deviceProduct').value = ''; $('deviceSerial').value = ''; $('deviceFirmware').value = '';
+  } else if (presets[value]) {
+    $('deviceName').value = presets[value][0]; $('deviceProduct').value = presets[value][1];
+  }
 };
 
 $('mfaForm').onsubmit = async e => {
