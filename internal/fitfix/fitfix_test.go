@@ -204,7 +204,7 @@ func mywhooshLike(t *testing.T) []byte {
 	for i := 0; i < n; i++ {
 		a.Records = append(a.Records, mesgdef.NewRecord(nil).
 			SetTimestamp(start.Add(time.Duration(i)*time.Second)).
-			SetPower(200).SetHeartRate(150).SetCadence(90))
+			SetPower(200).SetHeartRate(150).SetCadence(90).SetSpeed(7500))
 	}
 	end := start.Add((n - 1) * time.Second)
 	a.Events = append(a.Events, mesgdef.NewEvent(nil).SetTimestamp(end).
@@ -213,6 +213,8 @@ func mywhooshLike(t *testing.T) []byte {
 		SetTotalElapsedTime((n-1)*1000).SetTotalTimerTime((n-1)*1000))
 	a.Sessions = append(a.Sessions, mesgdef.NewSession(nil).SetTimestamp(start).SetStartTime(start).
 		SetTotalElapsedTime((n-1)*1000).SetTotalTimerTime((n-1)*1000).
+		SetTotalDistance((n-1)*750).           // 7.5 m/s in cm
+		SetAvgSpeed(0).SetEnhancedAvgSpeed(0). // MyWhoosh writes 0
 		SetSport(typedef.SportCycling).SetSubSport(typedef.SubSportVirtualActivity))
 	a.Activity = mesgdef.NewActivity(nil).SetTimestamp(start).SetNumSessions(1).
 		SetType(typedef.ActivityManual).
@@ -313,5 +315,35 @@ func TestFixFitKeepsSensorDeviceInfos(t *testing.T) {
 		if di.DeviceIndex == 1 && (di.Manufacturer != typedef.ManufacturerWahooFitness || di.SerialNumber != 777) {
 			t.Errorf("sensor device_info was modified: %+v", di)
 		}
+	}
+}
+
+func TestFixFitFillsSessionSpeed(t *testing.T) {
+	fixed, err := FixFit(mywhooshLike(t), device.Fallback, time.UTC, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := decodeActivity(t, fixed).Sessions[0]
+	if s.AvgSpeed != 7500 || s.EnhancedAvgSpeed != 7500 {
+		t.Errorf("avg speed = %d / enhanced %d, want 7500", s.AvgSpeed, s.EnhancedAvgSpeed)
+	}
+	if s.MaxSpeed != 7500 || s.EnhancedMaxSpeed != 7500 {
+		t.Errorf("max speed = %d / enhanced %d, want 7500", s.MaxSpeed, s.EnhancedMaxSpeed)
+	}
+}
+
+func TestFixSessionSpeedKeepsExistingValues(t *testing.T) {
+	s := mesgdef.NewSession(nil).SetTotalDistance(100000).SetTotalTimerTime(100000).
+		SetAvgSpeed(5000).SetMaxSpeed(9000)
+	if fixSessionSpeed(s, 12000) {
+		t.Error("existing average speed was overwritten")
+	}
+	if s.AvgSpeed != 5000 || s.MaxSpeed != 9000 {
+		t.Errorf("avg/max = %d/%d, want 5000/9000", s.AvgSpeed, s.MaxSpeed)
+	}
+
+	empty := mesgdef.NewSession(nil)
+	if fixSessionSpeed(empty, 0) {
+		t.Error("speed set without distance/time")
 	}
 }
