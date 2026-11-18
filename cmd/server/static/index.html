@@ -77,17 +77,15 @@
       </div>
     </div>
     <h2 style="margin-top:18px">Gerät für Aktivitäten</h2>
-    <p class="muted">Standardmäßig wird dein primäres Garmin-Gerät automatisch aus Garmin Connect gelesen. Optional kannst du es hier überschreiben. Die Unit-ID wird nur in deiner lokalen Konfiguration gespeichert.</p>
+    <p class="muted">Standardmäßig wird ein virtuelles Garmin Edge 830 mit einer eigenen, zufälligen Unit-ID eingetragen. So berechnet Garmin Training Effect und Belastung, und die Fahrt wird per Physio TrueUp auf deine Uhr übertragen. <b>Trage hier nicht die Unit-ID deiner eigenen Uhr ein:</b> Garmin hält die Fahrt dann für schon auf der Uhr vorhanden und überträgt sie nicht. Eine solche Einstellung wird ignoriert.</p>
     <label>Geräteprofil</label>
     <select id="devicePreset" style="width:100%;padding:8px;background:#0b121a;border:1px solid var(--line);border-radius:6px;color:var(--text)">
-      <option value="auto">Primäres Gerät aus Garmin Connect (empfohlen)</option>
-      <option value="fenix8-amoled">fēnix 8 AMOLED 47 / 51 mm (Produkt 4536)</option>
-      <option value="fenix8-solar">fēnix 8 Solar 47 mm (Produkt 4532)</option>
-      <option value="fenix8-solar-large">fēnix 8 Solar 51 mm (Produkt 4533)</option>
-      <option value="custom">Eigenes Gerät / andere Variante</option>
+      <option value="auto">Virtuelles Edge 830, automatisch (empfohlen)</option>
+      <option value="edge830">Edge 830 mit eigener Unit-ID (Produkt 3122)</option>
+      <option value="custom">Anderes Gerät</option>
     </select>
-    <div class="row"><div><label>Modellname</label><input id="deviceName" placeholder="z. B. fēnix 8 47 mm"></div><div><label>FIT Produkt-ID</label><input id="deviceProduct" type="number" min="1" max="65535" placeholder="z. B. 4536"></div></div>
-    <div class="row"><div><label>Unit-ID / Seriennummer</label><input id="deviceSerial" type="number" min="1" max="4294967295" placeholder="nur lokal gespeichert"></div><div><label>Firmware-Version (optional, z. B. 23.39)</label><input id="deviceFirmware" type="text" placeholder="wird als FIT-Version gespeichert"></div></div>
+    <div class="row"><div><label>Modellname</label><input id="deviceName" placeholder="z. B. Edge 830"></div><div><label>FIT Produkt-ID</label><input id="deviceProduct" type="number" min="1" max="65535" placeholder="z. B. 3122"></div></div>
+    <div class="row"><div><label>Unit-ID / Seriennummer</label><input id="deviceSerial" type="number" min="1" max="4294967295" placeholder="nicht die deiner Uhr"></div><div><label>Firmware-Version (optional, z. B. 9.75)</label><input id="deviceFirmware" type="text" placeholder="wird als FIT-Version gespeichert"></div></div>
     <div style="margin-top:12px"><button id="saveCfg">Konfiguration speichern</button><span id="cfgMsg" class="status muted" style="margin-left:10px"></span></div>
   </section>
 
@@ -233,9 +231,7 @@ $('saveCfg').onclick = async () => {
 
 $('devicePreset').onchange = () => {
   const presets = {
-    'fenix8-amoled': ['fēnix 8 AMOLED 47 mm', 4536],
-    'fenix8-solar': ['fēnix 8 Solar 47 mm', 4532],
-    'fenix8-solar-large': ['fēnix 8 Solar 51 mm', 4533],
+    'edge830': ['Edge 830', 3122],
   };
   const value = $('devicePreset').value;
   if (value === 'auto') {

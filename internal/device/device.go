@@ -2,15 +2,18 @@
 // (MyWhoosh FIT and JOIN TCX) before they are uploaded to Garmin Connect.
 //
 // Garmin only computes Training Effect, VO2max etc. for activities recorded by
-// Garmin devices, and physiological metrics are stored per device. The files
-// should therefore carry the user's own primary training device (product ID +
-// unit ID from the Garmin account), so the results are credited to that watch
-// and reach it via Physio TrueUp. Fallback is a generic fenix 6S identity.
+// Garmin devices. The identity must NOT be the user's own watch: Physio TrueUp
+// only pushes activities from *other* devices to the watch, so an activity that
+// carries the watch's own unit ID is assumed to be on the watch already and
+// never reaches it. By default every installation therefore gets its own
+// virtual Edge 830 with a random unit ID, generated once and kept in
+// virtual_device.json.
 package device
 
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 )
@@ -26,12 +29,37 @@ type Identity struct {
 	SoftwareVersion uint16 `json:"software_version"` // firmware × 100 (23.39 → 2339)
 }
 
-// Fallback is used only when no account device or local override is available.
+// Profile of the virtual device written into patched files by default.
+const (
+	DefaultName            = "Edge 830"
+	DefaultProduct         = 3122 // typedef.GarminProductEdge830
+	DefaultSoftwareVersion = 975  // firmware 9.75
+)
+
+// Fallback is used only when no valid identity is available at all (e.g. the
+// data directory is not writable).
 var Fallback = Identity{
-	Name:            "fenix 6S Pro",
-	Product:         3288, // typedef.GarminProductFenix6s
+	Name:            DefaultName,
+	Product:         DefaultProduct,
 	SerialNumber:    1,
-	SoftwareVersion: 2511,
+	SoftwareVersion: DefaultSoftwareVersion,
+}
+
+// Range of generated unit IDs (plausible for Garmin devices of that era).
+const (
+	serialMin = 3_300_000_000
+	serialMax = 3_499_999_999
+)
+
+// NewVirtual returns a virtual Edge 830 with a random unit ID that is not in
+// taken (the unit IDs of the user's real devices; may be nil).
+func NewVirtual(taken map[uint32]string) Identity {
+	for {
+		serial := uint32(serialMin + rand.Uint64N(serialMax-serialMin+1))
+		if _, used := taken[serial]; !used {
+			return Identity{Name: DefaultName, Product: DefaultProduct, SerialNumber: serial, SoftwareVersion: DefaultSoftwareVersion}
+		}
+	}
 }
 
 // Valid reports whether the identity can be written to a file.
@@ -52,9 +80,18 @@ func (id Identity) CreatorXML() string {
 	)
 }
 
-const cacheFile = "device.json"
+const (
+	cacheFile  = "virtual_device.json"
+	legacyFile = "device.json" // cached copy of the user's own watch (≤ v1.0.1)
+)
 
-// Load reads the cached identity from dir.
+// RemoveLegacy deletes the device.json written by earlier versions, which held
+// the user's own watch and must no longer be used.
+func RemoveLegacy(dir string) {
+	_ = os.Remove(filepath.Join(dir, legacyFile))
+}
+
+// Load reads the stored virtual identity from dir.
 func Load(dir string) (Identity, bool) {
 	var id Identity
 	data, err := os.ReadFile(filepath.Join(dir, cacheFile))
@@ -64,7 +101,7 @@ func Load(dir string) (Identity, bool) {
 	return id, true
 }
 
-// Save caches the identity in dir.
+// Save stores the virtual identity in dir.
 func Save(dir string, id Identity) error {
 	data, err := json.MarshalIndent(id, "", "  ")
 	if err != nil {

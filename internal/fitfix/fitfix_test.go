@@ -178,8 +178,8 @@ func TestFixFitSpoofsDevice(t *testing.T) {
 	if act.FileId.Manufacturer != typedef.ManufacturerGarmin {
 		t.Errorf("manufacturer = %v, want Garmin", act.FileId.Manufacturer)
 	}
-	if act.FileId.Product != typedef.GarminProductFenix6s.Uint16() {
-		t.Errorf("product = %d, want fenix 6s", act.FileId.Product)
+	if act.FileId.Product != typedef.GarminProductEdge830.Uint16() {
+		t.Errorf("product = %d, want Edge 830", act.FileId.Product)
 	}
 }
 
