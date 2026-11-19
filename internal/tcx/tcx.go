@@ -1,7 +1,8 @@
 // Package tcx reads JOIN Cycling workout player TCX files and rewrites them
 // so Garmin Connect fully processes the activity: the 3rd-party <Author>
-// element is removed and a Garmin fenix 6S device <Creator> block is injected
-// into every activity. Track data is left byte-for-byte intact.
+// element is removed and a Garmin device <Creator> block (the user's own
+// device, see package device) is injected into every activity. Track data is
+// left byte-for-byte intact.
 package tcx
 
 import (

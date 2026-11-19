@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"mywhoosh2garmin/internal/device"
 	"mywhoosh2garmin/mywhoosh"
 )
 
@@ -157,5 +158,40 @@ func TestApplyConfigFlagsAccountChange(t *testing.T) {
 	s.ApplyConfig(Config{MyWhooshEmail: "other@x.io", GarminEmail: "g@x.io"})
 	if !s.mwStale || s.garminStale {
 		t.Errorf("only the MyWhoosh session should be stale: mw=%v garmin=%v", s.mwStale, s.garminStale)
+	}
+}
+
+func TestChooseIdentityNeverUsesOwnDevice(t *testing.T) {
+	watch := device.Identity{Name: "fenix 8", Product: 4532, SerialNumber: 3500000001, SoftwareVersion: 2339}
+	virtual := device.Identity{Name: "Edge 830", Product: 3122, SerialNumber: 3398000000, SoftwareVersion: 975}
+	own := map[uint32]string{watch.SerialNumber: "fēnix 8"}
+
+	// Override that is not one of the user's devices is used as-is.
+	other := device.Identity{Name: "Edge 1030", Product: 2713, SerialNumber: 3300000123, SoftwareVersion: 1000}
+	if id, created, warn := chooseIdentity(other, virtual, own); id != other || created || warn != "" {
+		t.Errorf("foreign override: got %+v created=%v warn=%q", id, created, warn)
+	}
+
+	// Override with the watch's own unit ID is rejected in favour of the virtual device.
+	id, created, warn := chooseIdentity(watch, virtual, own)
+	if id != virtual || created || warn == "" {
+		t.Errorf("own override: got %+v created=%v warn=%q", id, created, warn)
+	}
+
+	// Without a stored device a new virtual one is generated, never the watch.
+	id, created, _ = chooseIdentity(device.Identity{}, device.Identity{}, own)
+	if !created || id.Product != device.DefaultProduct || id.SerialNumber == watch.SerialNumber {
+		t.Errorf("new virtual: got %+v created=%v", id, created)
+	}
+
+	// A stored identity that collides with a real device is replaced.
+	id, created, _ = chooseIdentity(device.Identity{}, watch, own)
+	if !created || id.SerialNumber == watch.SerialNumber {
+		t.Errorf("colliding stored: got %+v created=%v", id, created)
+	}
+
+	// Device list unknown (nil): stored virtual device is kept.
+	if id, created, _ := chooseIdentity(device.Identity{}, virtual, nil); id != virtual || created {
+		t.Errorf("unknown devices: got %+v created=%v", id, created)
 	}
 }

@@ -19,7 +19,7 @@ MyWhoosh exportiert FIT-Dateien, die Garmin nicht vollständig verarbeitet:
 |---|---|
 | Durchschnittsleistung / -puls / -kadenz fehlen | werden aus den Aufzeichnungen berechnet |
 | Falsche Temperaturwerte in jedem Datensatz | werden entfernt |
-| Unbekanntes Gerät → Garmin ignoriert Training Effect & VO2max | Dein **primäres Trainingsgerät** aus Garmin Connect (Modell, Unit-ID, Firmware) wird als Aufzeichnungsgerät eingetragen — so landen VO2max & Co. bei deiner Uhr (Physio TrueUp) |
+| Unbekanntes Gerät → Garmin ignoriert Training Effect & Belastung | Ein **virtuelles Garmin Edge 830** mit eigener, zufälliger Unit-ID wird als Aufzeichnungsgerät eingetragen. Garmin berechnet dann Training Effect & Belastung, und per Physio TrueUp kommt die Fahrt auf deine Uhr. Absichtlich **nicht** deine eigene Uhr, sonst hält Garmin die Fahrt für schon auf der Uhr vorhanden und überträgt sie nicht |
 | Falsche Zeitstempel (Ende = Start, lokale Zeit in falscher Epoche), leeres Start-Event | werden korrigiert, Timer-Start/-Stopp ergänzt |
 
 ## Windows-App
@@ -138,11 +138,13 @@ curl -X POST http://localhost:8080/api/webhook/upload \
 
 ### JOIN Cycling (TCX)
 
-Der JOIN Workout-Player exportiert TCX-Dateien, die Garmin Connect nicht direkt annimmt. Der Server entfernt den JOIN-Author-Block und trägt dein primäres Trainingsgerät als `<Creator>` ein. Die Trackdaten (Leistung, Puls, Kadenz, Geschwindigkeit) bleiben unverändert.
+Der JOIN Workout-Player exportiert TCX-Dateien, die Garmin Connect nicht direkt annimmt. Der Server entfernt den JOIN-Author-Block und trägt das virtuelle Edge 830 als `<Creator>` ein. Die Trackdaten (Leistung, Puls, Kadenz, Geschwindigkeit) bleiben unverändert.
 
 ## Einschränkungen
 
-- Das Gerät wird beim ersten Upload aus Garmin Connect gelesen und in `device.json` im Datenordner gespeichert (alle 24 h aktualisiert). Alternativ kann in der Web-App ein Geräteprofil oder ein eigenes Gerät mit lokaler Unit-ID gesetzt werden; diese Werte liegen in `config.json` im Datenordner und gehören nicht ins öffentliche Repository. Ohne eigene Auswahl und ohne ermittelbares Garmin-Gerät wird weiterhin ein generisches Ersatzprofil verwendet.
+- Die Unit-ID des virtuellen Edge 830 wird beim ersten Upload zufällig erzeugt und in `virtual_device.json` im Datenordner gespeichert, damit alle Fahrten demselben Gerät zugeordnet werden. Dabei wird geprüft, dass sie mit keinem Gerät in deinem Garmin-Konto übereinstimmt. Die `device.json` älterer Versionen (sie enthielt deine eigene Uhr) wird gelöscht.
+- In der Web-App kann ein anderes Gerät mit eigener Unit-ID gesetzt werden (liegt in `config.json` im Datenordner). Gehört diese Unit-ID zu einem Gerät in deinem Garmin-Konto, wird sie ignoriert und das virtuelle Edge 830 verwendet.
+- Fahrten, die schon mit der Kennung deiner Uhr hochgeladen wurden, kommen nicht nachträglich auf die Uhr. Das Gerät lässt sich in Garmin Connect nicht ändern: Aktivität dort löschen und mit dem Tool neu hochladen (in der Web-App vorher bei der Fahrt **Markierung entfernen**).
 - Die lokale Uhrzeit der Fahrt wird aus der Zeitzone des Rechners bestimmt. Im Docker-Container steuert das `TZ` in `.env` (Standard `Europe/Berlin`).
 
 - **Kein MFA**: Ist bei deinem Garmin-Konto die Zwei-Faktor-Anmeldung aktiv, schlägt der Login fehl.

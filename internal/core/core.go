@@ -168,8 +168,11 @@ type Syncer struct {
 	knownMu sync.Mutex
 	known   map[string]mywhoosh.Activity // last fetched activities by ID
 
-	dev   device.Identity // device written into patched files (guarded by opMu)
-	devAt time.Time       // when dev was last read from Garmin Connect
+	dev    device.Identity   // virtual device of this data directory (guarded by opMu)
+	used   device.Identity   // device used for the last upload, for logging (guarded by opMu)
+	own    map[uint32]string // unit IDs of the account's real devices (guarded by opMu)
+	ownAt  time.Time         // when own was last read from Garmin Connect
+	ownErr bool              // last attempt to read own failed (warning already logged)
 }
 
 // New creates a Syncer rooted at dataDir (tokens, config.json, synced.json).
@@ -555,63 +558,109 @@ func (s *Syncer) ensureGarmin() error {
 	return nil
 }
 
-// deviceRefresh is how long a device identity read from Garmin is reused.
-const deviceRefresh = 24 * time.Hour
+// ownDevicesRefresh is how long the account's device list is reused.
+const ownDevicesRefresh = 24 * time.Hour
 
-// deviceIdentity returns the Garmin device written into patched files: the
-// account's primary training device (product, unit ID, firmware), read from
-// Garmin Connect and cached in device.json. If it cannot be determined, the
-// cached value or device.Fallback is used. The caller must hold opMu.
+// deviceIdentity returns the Garmin device written into patched files. It is
+// never one of the user's own devices: Garmin does not sync an activity to a
+// watch that supposedly recorded it itself (Physio TrueUp only transfers
+// activities from other devices). The caller must hold opMu.
 func (s *Syncer) deviceIdentity() device.Identity {
-	cfg := s.Config()
-	if cfg.DeviceProduct != 0 && cfg.DeviceSerial != 0 {
-		name := cfg.DeviceName
-		if name == "" {
-			name = "Garmin device"
-		}
-		firmware := cfg.DeviceFirmware
-		if firmware == 0 {
-			firmware = device.Fallback.SoftwareVersion
-		}
-		return device.Identity{Name: name, Product: cfg.DeviceProduct, SerialNumber: cfg.DeviceSerial, SoftwareVersion: firmware}
+	id, created, warning := chooseIdentity(overrideIdentity(s.Config()), s.storedIdentity(), s.ownDevices())
+	if warning != "" {
+		s.log("  ⚠ %s", warning)
 	}
-	if s.dev.Valid() && time.Since(s.devAt) < deviceRefresh {
-		return s.dev
+	if created {
+		if err := device.Save(s.dataDir, id); err != nil {
+			s.log("  ⚠ Gerätekennung konnte nicht gespeichert werden: %v", err)
+		}
+		s.log("  Neue Gerätekennung erzeugt: %s", id)
+		s.dev = id
 	}
+	if id != s.used {
+		s.log("  Gerät für Uploads: %s", id)
+		s.used = id
+	}
+	return id
+}
 
-	if err := s.ensureGarmin(); err == nil {
-		d, err := s.garmin.PrimaryTrainingDevice()
-		if err == nil {
-			id := device.Identity{
-				Name:            d.DisplayName,
-				Product:         d.ProductID(),
-				SerialNumber:    d.UnitID,
-				SoftwareVersion: d.SoftwareVersion(),
-			}
-			if id.SoftwareVersion == 0 {
-				id.SoftwareVersion = device.Fallback.SoftwareVersion
-			}
-			if id != s.dev {
-				s.log("  Garmin-Gerät: %s", id)
-			}
-			s.dev, s.devAt = id, time.Now()
-			if err := device.Save(s.dataDir, id); err != nil {
-				s.log("  ⚠ Gerät konnte nicht gespeichert werden: %v", err)
-			}
-			return id
-		}
-		s.log("  ⚠ Primäres Trainingsgerät nicht ermittelbar: %v", err)
+// overrideIdentity returns the device configured by the user (zero if none).
+func overrideIdentity(cfg Config) device.Identity {
+	if cfg.DeviceProduct == 0 || cfg.DeviceSerial == 0 {
+		return device.Identity{}
 	}
+	name := cfg.DeviceName
+	if name == "" {
+		name = "Garmin device"
+	}
+	firmware := cfg.DeviceFirmware
+	if firmware == 0 {
+		firmware = device.DefaultSoftwareVersion
+	}
+	return device.Identity{Name: name, Product: cfg.DeviceProduct, SerialNumber: cfg.DeviceSerial, SoftwareVersion: firmware}
+}
 
+// storedIdentity returns the virtual device of this data directory (zero if
+// none has been generated yet).
+func (s *Syncer) storedIdentity() device.Identity {
 	if s.dev.Valid() {
 		return s.dev
 	}
+	device.RemoveLegacy(s.dataDir)
 	if id, ok := device.Load(s.dataDir); ok {
 		s.dev = id
 		return id
 	}
-	s.log("  ⚠ Nutze Ersatzgerät %s — VO2max wird evtl. nicht deiner Uhr zugeordnet", device.Fallback)
-	return device.Fallback
+	return device.Identity{}
+}
+
+// ownDevices returns the unit IDs of the devices registered in the Garmin
+// account (nil if they cannot be read).
+func (s *Syncer) ownDevices() map[uint32]string {
+	if s.own != nil && time.Since(s.ownAt) < ownDevicesRefresh {
+		return s.own
+	}
+	err := s.ensureGarmin()
+	var devices []garmin.Device
+	if err == nil {
+		devices, err = s.garmin.Devices()
+	}
+	if err != nil {
+		if !s.ownErr {
+			s.log("  ⚠ Garmin-Geräte nicht abrufbar, Gerätekennung wird nicht gegengeprüft: %v", err)
+			s.ownErr = true
+		}
+		return s.own
+	}
+	own := make(map[uint32]string, len(devices))
+	for _, d := range devices {
+		if d.UnitID != 0 {
+			own[d.UnitID] = d.DisplayName
+		}
+	}
+	s.own, s.ownAt, s.ownErr = own, time.Now(), false
+	return own
+}
+
+// chooseIdentity picks the device for patched files: the user's override if
+// it is not one of their own devices, otherwise the stored virtual device, or
+// a freshly generated one (created = true, must be saved). warning explains
+// why an override or stored identity was rejected.
+func chooseIdentity(override, stored device.Identity, own map[uint32]string) (id device.Identity, created bool, warning string) {
+	if override.Valid() {
+		name, mine := own[override.SerialNumber]
+		if !mine {
+			return override, false, ""
+		}
+		warning = fmt.Sprintf("Die eingestellte Unit-ID %d gehört zu deinem Gerät %q. Garmin überträgt solche Aktivitäten nicht auf die Uhr, deshalb wird stattdessen ein virtuelles %s genutzt. Bitte die Geräte-Einstellung zurücksetzen.",
+			override.SerialNumber, name, device.DefaultName)
+	}
+	if stored.Valid() {
+		if _, mine := own[stored.SerialNumber]; !mine {
+			return stored, false, warning
+		}
+	}
+	return device.NewVirtual(own), true, warning
 }
 
 // ensureMyWhoosh logs in to MyWhoosh, resuming a cached session if possible.

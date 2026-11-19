@@ -29,7 +29,7 @@ func TestFixTcx(t *testing.T) {
 	}
 
 	// 2. Garmin Creator block injected before every </Activity>
-	wantCreator := `<Creator xsi:type="Device_t"><Name>fenix 6S Pro</Name>`
+	wantCreator := `<Creator xsi:type="Device_t"><Name>Edge 830</Name>`
 	if !strings.Contains(string(fixed), wantCreator) {
 		t.Errorf("patched TCX missing Garmin Creator block")
 	}

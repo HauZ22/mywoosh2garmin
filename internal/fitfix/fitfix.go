@@ -64,8 +64,12 @@ func FixFit(data []byte, id device.Identity, loc *time.Location, logf LogFunc) (
 	// Collect metrics from records and strip temperature
 	var powers []uint16
 	var heartRates, cadences []uint8
+	var maxSpeed uint32 // mm/s
 
 	for _, rec := range activity.Records {
+		if s := recordSpeed(rec); s > maxSpeed {
+			maxSpeed = s
+		}
 		if rec.Power != uint16Invalid {
 			powers = append(powers, rec.Power)
 		}
@@ -101,6 +105,9 @@ func FixFit(data []byte, id device.Identity, loc *time.Location, logf LogFunc) (
 			sess.AvgCadence = avgU8(cadences)
 			logf("  → Ø Trittfrequenz: %d rpm", sess.AvgCadence)
 		}
+		if fixSessionSpeed(sess, maxSpeed) {
+			logf("  → Ø Geschwindigkeit: %.1f km/h", float64(sess.EnhancedAvgSpeed)*3.6/1000)
+		}
 	}
 
 	if fixTimes(activity, loc) {
@@ -121,6 +128,46 @@ func FixFit(data []byte, id device.Identity, loc *time.Location, logf LogFunc) (
 		return nil, fmt.Errorf("encode: %w", err)
 	}
 	return out.Bytes(), nil
+}
+
+// recordSpeed returns the record's speed in mm/s (0 if unset).
+func recordSpeed(r *mesgdef.Record) uint32 {
+	if r.EnhancedSpeed != uint32Invalid && r.EnhancedSpeed != 0 {
+		return r.EnhancedSpeed
+	}
+	if r.Speed != uint16Invalid {
+		return uint32(r.Speed)
+	}
+	return 0
+}
+
+// fixSessionSpeed fills in average and maximum speed. MyWhoosh writes 0 as
+// average speed although total distance and timer time are known. maxSpeed is
+// the highest record speed in mm/s. Reports whether the average was set.
+func fixSessionSpeed(s *mesgdef.Session, maxSpeed uint32) bool {
+	if shouldFixU16(s.MaxSpeed) && (s.EnhancedMaxSpeed == uint32Invalid || s.EnhancedMaxSpeed == 0) && maxSpeed > 0 {
+		s.EnhancedMaxSpeed = maxSpeed
+		if maxSpeed < uint32(uint16Invalid) {
+			s.MaxSpeed = uint16(maxSpeed)
+		}
+	}
+	if !shouldFixU16(s.AvgSpeed) || (s.EnhancedAvgSpeed != uint32Invalid && s.EnhancedAvgSpeed != 0) {
+		return false
+	}
+	if s.TotalDistance == uint32Invalid || s.TotalDistance == 0 ||
+		s.TotalTimerTime == uint32Invalid || s.TotalTimerTime == 0 {
+		return false
+	}
+	// distance in cm, time in ms → speed in mm/s
+	avg := uint64(s.TotalDistance) * 10000 / uint64(s.TotalTimerTime)
+	if avg >= uint64(uint32Invalid) {
+		return false
+	}
+	s.EnhancedAvgSpeed = uint32(avg)
+	if avg < uint64(uint16Invalid) {
+		s.AvgSpeed = uint16(avg)
+	}
+	return true
 }
 
 func shouldFixU16(v uint16) bool { return v == uint16Invalid || v == 0 }
